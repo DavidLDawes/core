@@ -24,6 +24,8 @@ concurrency:
 env:
   ARM_TOOLCHAIN_VERSION: 14.2.rel1
   PICO_SDK_VERSION: 2.1.1
+  DRIVER_REPO: https://github.com/DavidLDawes/RP2040.git
+  DRIVER_REF: master
 
 jobs:
   build:
@@ -110,9 +112,11 @@ jobs:
             echo "already patched"
           fi
 
+      # Uses the DavidLDawes fork, not grblHAL/RP2040 upstream, so that driver-side
+      # fixes are exercised by core CI before they go anywhere near upstream.
       - name: Check out RP2040 driver
         run: |
-          git clone --depth 1 https://github.com/grblHAL/RP2040.git driver
+          git clone --depth 1 -b "$DRIVER_REF" "$DRIVER_REPO" driver
           cd driver
           git submodule update --init --depth 1 --recursive
 
