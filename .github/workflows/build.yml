@@ -57,13 +57,13 @@ jobs:
 
     steps:
       - name: Check out core
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: core
 
       - name: Cache Arm GNU toolchain
         id: cache-arm
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/toolchain
           key: arm-gnu-${{ env.ARM_TOOLCHAIN_VERSION }}
@@ -85,7 +85,7 @@ jobs:
 
       - name: Cache Pico SDK
         id: cache-sdk
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/pico-sdk
           key: pico-sdk-${{ env.PICO_SDK_VERSION }}-patched
@@ -173,7 +173,7 @@ jobs:
           arm-none-eabi-size "$elf"
 
       - name: Upload firmware
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: grblHAL-${{ matrix.name }}
           path: |
