@@ -75,7 +75,8 @@ Last updated 2026-09-10.
 | 6 | Review of the core + driver combination (Part 4) | **done** |
 | 7 | Flash and run on real hardware (§1.4) | **not started** — no board yet |
 | 8 | Host-side build so the core can be tested without hardware (§2.4) | **not started** |
-| 9 | Any code fix from Parts 2–4 | **not started** — all findings still open |
+| 9 | Part 5 Step 1 — the two HIGH core safety fixes | **done** — §2.1(1) and §2.1(2) |
+| 10 | Remaining code fixes from Parts 2–4 | **not started** |
 
 The toolchain is installed and a full clean build has been verified on this
 machine, producing `play/RP2040/build/grblHAL.uf2` (447 KB, family
@@ -132,10 +133,13 @@ verified build.
 
 Two files decide what gets built:
 
-* **`RP2040/CMakeLists.txt` line 29** — `set(PICO_BOARD pico2 CACHE STRING ...)`.
-  Changed from the default `pico`. This selects the MCU family, so getting it
-  wrong produces link errors rather than a subtly wrong binary. Other valid
-  values: `pico`, `pico_w`, `pico2_w`, `pimoroni_pga2350` (RP2350B_5X board).
+* **Board selection is passed on the command line**, not edited into the driver's
+  tracked `CMakeLists.txt` — that file keeps its upstream default of `pico` so the
+  working tree never diverges from the fork (Part 3 §3.2). `build.sh` passes
+  `-DPICO_BOARD=pico2`; override per invocation with `PICO_BOARD=pico ./build.sh`.
+  This selects the MCU family, so getting it wrong produces link errors rather than
+  a subtly wrong binary. Other valid values: `pico`, `pico_w`, `pico2_w`,
+  `pimoroni_pga2350` (RP2350B_5X board).
 * **`RP2040/my_machine.h`** — every `BOARD_*` left commented out, so pin
   assignments come from `boards/generic_map.h`. `USB_SERIAL_CDC` is on by
   default. This is the right state for proving the toolchain; pick a real board
@@ -333,16 +337,19 @@ everywhere?" and nothing more.
 
 # Part 2 — Code review findings (core)
 
-Reviewed at commit `516e5ad` (upstream `master`, now our `main`). No C source in this tree has been modified
-since — only documentation and CI have been added — so every finding below still
-stands as written, and all of them are upstream issues rather than local regressions.
+Reviewed at commit `516e5ad` (upstream `master`, now our `main`). All findings originate
+upstream rather than as local regressions.
 
-**All findings are from reading, not from compiling or running.** File:line references are
-given so each can be confirmed.
+Findings marked **FIXED** have been addressed on this fork; the rest are still open.
+Line numbers are as of the original review, so they may have shifted slightly in fixed
+files.
+
+**Findings are from reading, not from running.** Fixes are verified as *compiling*
+across the six CI configurations — nothing has been executed on hardware.
 
 ## 2.1 Confirmed defects
 
-### 1. `settings.c:3227` — persistent NULL deref after one failed `realloc` — HIGH
+### 1. `settings.c:3227` — persistent NULL deref after one failed `realloc` — HIGH — **FIXED**
 
 In `setting_get_description()`:
 
@@ -358,7 +365,7 @@ single OOM poisons the function for the rest of the boot.
 
 Fix: assign to a temp, only commit `buflen` on success.
 
-### 2. `stepper.c:524` — `free()` called from the stepper ISR — HIGH
+### 2. `stepper.c:524` — `free()` called from the stepper ISR — HIGH — **FIXED**
 
 Inside `stepper_driver_interrupt_handler()` (`ISR_CODE`, line 453, runs at up to ~300 kHz),
 on the path where `task_add_immediate()` fails because the task pool is full:

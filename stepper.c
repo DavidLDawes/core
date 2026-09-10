@@ -95,6 +95,10 @@ static float cycles_per_min;
 static plan_block_t *pl_block;     // Pointer to the planner block being prepped
 static st_block_t *st_prep_block;  // Pointer to the stepper block data being prepped
 static st_block_t st_hold_block;   // Copy of stepper block data for block put on hold during parking
+//! Message the stepper interrupt handler could not hand to the foreground because the task
+//! pool was exhausted. Freeing it there is not allowed, so the pointer is parked here for
+//! st_prep_buffer() to reclaim. Written by the ISR only when NULL, cleared by the foreground.
+static char *volatile orphaned_message = NULL;
 
 // Segment preparation data struct. Contains all the necessary information to compute new segments
 // based on the current executing planner block.
@@ -520,8 +524,13 @@ ISR_CODE void ISR_FUNC(stepper_driver_interrupt_handler)(void)
 
                 // Enqueue any message to be printed (by foreground process)
                 if(st.exec_block->message) {
-                    if(!task_add_immediate((foreground_task_ptr)gc_output_message, st.exec_block->message))
-                        free(st.exec_block->message);
+                    // NOTE: free() must never be called from interrupt context - with most
+                    // newlib configurations the heap lock is a no-op, so freeing here while
+                    // the foreground is inside malloc()/free() corrupts the heap. If the task
+                    // pool is exhausted park the pointer instead; st_prep_buffer() reclaims it.
+                    if(!task_add_immediate((foreground_task_ptr)gc_output_message, st.exec_block->message) &&
+                        orphaned_message == NULL)
+                        orphaned_message = st.exec_block->message;
                     st.exec_block->message = NULL;
                 }
 
@@ -882,6 +891,19 @@ FLASHMEM void st_parking_restore_buffer (void)
 */
 void st_prep_buffer (void)
 {
+    // Reclaim a message the stepper interrupt handler could not enqueue. This runs in the
+    // foreground, so free() is safe here. Claim the pointer with interrupts disabled so the
+    // ISR cannot park another one between the read and the clear.
+    if(orphaned_message) {
+
+        hal.irq_disable();
+        char *message = orphaned_message;
+        orphaned_message = NULL;
+        hal.irq_enable();
+
+        free(message);
+    }
+
     // Block step prep buffer, while in a suspend state and there is no suspend motion to execute.
     if (sys.step_control.end_motion)
         return;
