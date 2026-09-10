@@ -8,9 +8,27 @@ firmware image:
 | core (this repo) | `DavidLDawes/core` | `grblHAL/core` |
 | RP2040/RP2350 driver | `DavidLDawes/RP2040` | `grblHAL/RP2040` |
 
-**All changes are made on the `DavidLDawes` forks.** Upstream is fetch-only; we
-have no push access to either, and nothing goes back there except as a
-deliberate PR later.
+**All changes are made on the `DavidLDawes` forks. Nothing is ever pushed to
+`grblHAL/*`.** Upstream is fetch-only, and both local clones enforce this — the
+`upstream` remote has its push URL set to a deliberately invalid value:
+
+```bash
+git remote set-url --push upstream DISABLED_no_push_to_upstream
+```
+
+so an accidental `git push upstream` fails instead of prompting for credentials.
+Contributing anything back is a separate, deliberate decision (see Part 5).
+
+**Branch convention: `main`.** Both forks were renamed from `master` to `main`
+and `main` is the default branch on each. Upstream still uses `master`, so
+syncing from upstream is explicit:
+
+```bash
+git fetch upstream
+git merge upstream/master        # or: git rebase upstream/master
+```
+
+Changes reach `main` by pull request, with CI required on the PR.
 
 * **Part 1** — getting a compiler working, and CI.
 * **Part 2** — code review of the core.
@@ -91,7 +109,7 @@ directory removes the lot. `play/toolchain/env.sh` sets the environment;
 | CMake | 3.31.8 | `toolchain/cmake-3.31.8-windows-x86_64/` | portable zip from Kitware |
 | Ninja | 1.13.2 | `toolchain/ninja.exe` | `winget install Ninja-build.Ninja` |
 | Pico SDK | 2.1.1 | `toolchain/pico-sdk/` | `git clone -b 2.1.1 --recursive` |
-| grblHAL RP2040 driver | master | `play/RP2040/` | `git clone --recursive` |
+| grblHAL RP2040 driver | main | `play/RP2040/` | `git clone --recursive` |
 
 Portable zips were used over installers deliberately: no elevation, no UAC
 prompts, exact version pinning, and trivial removal.
@@ -240,7 +258,7 @@ none of the above lets the core be tested without hardware in the loop.
 ## 1.7 Continuous integration
 
 `.github/workflows/build.yml` runs on every pull request, every push to
-`master`, and on demand via *Actions → build → Run workflow*.
+`main`, and on demand via *Actions → build → Run workflow*.
 
 ### What it does
 
@@ -315,7 +333,7 @@ everywhere?" and nothing more.
 
 # Part 2 — Code review findings (core)
 
-Reviewed at commit `516e5ad` on `master`. No C source in this tree has been modified
+Reviewed at commit `516e5ad` (upstream `master`, now our `main`). No C source in this tree has been modified
 since — only documentation and CI have been added — so every finding below still
 stands as written, and all of them are upstream issues rather than local regressions.
 

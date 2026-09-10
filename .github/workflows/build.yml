@@ -14,7 +14,7 @@ name: build
 on:
   pull_request:
   push:
-    branches: [master]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -25,7 +25,7 @@ env:
   ARM_TOOLCHAIN_VERSION: 14.2.rel1
   PICO_SDK_VERSION: 2.1.1
   DRIVER_REPO: https://github.com/DavidLDawes/RP2040.git
-  DRIVER_REF: master
+  DRIVER_REF: main
 
 jobs:
   build:
