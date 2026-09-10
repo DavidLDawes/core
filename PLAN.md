@@ -1,6 +1,22 @@
-# grblHAL core — build setup and review findings
+# grblHAL — build setup and review findings
 
-Working notes. Part 1 gets a compiler working. Part 2 is the code review of this repo.
+Working notes covering the two repositories that are compiled together into one
+firmware image:
+
+| Repo | Fork we work in | Upstream |
+|---|---|---|
+| core (this repo) | `DavidLDawes/core` | `grblHAL/core` |
+| RP2040/RP2350 driver | `DavidLDawes/RP2040` | `grblHAL/RP2040` |
+
+**All changes are made on the `DavidLDawes` forks.** Upstream is fetch-only; we
+have no push access to either, and nothing goes back there except as a
+deliberate PR later.
+
+* **Part 1** — getting a compiler working, and CI.
+* **Part 2** — code review of the core.
+* **Part 3** — code review of the RP2040 driver.
+* **Part 4** — findings that only appear when the two are combined.
+* **Part 5** — recommended order of work.
 
 ---
 
@@ -27,7 +43,21 @@ on a Pi.
   PicoBOB, PicoCNC, BTT SKR Pico, PicoHAL. These have board maps already in the driver
   (see `my_machine.h`, §1.3).
 
-## 1.1 Status: working as of 2026-09-10
+## 1.1 Status
+
+Last updated 2026-09-10.
+
+| # | Item | Status |
+|---|---|---|
+| 1 | Local cross-compilation toolchain (§1.2) | **done** |
+| 2 | Clean build → `grblHAL.uf2` for Pico 2 (§1.3) | **done** |
+| 3 | Working notes: `CLAUDE.md`, `README.md`, `PLAN.md` | **done**, merged in PR #1 |
+| 4 | GitHub Actions build matrix on PRs and merges (§1.7) | **done**, all 6 jobs green |
+| 5 | Review of the RP2040 driver (Part 3) | **done** |
+| 6 | Review of the core + driver combination (Part 4) | **done** |
+| 7 | Flash and run on real hardware (§1.4) | **not started** — no board yet |
+| 8 | Host-side build so the core can be tested without hardware (§2.4) | **not started** |
+| 9 | Any code fix from Parts 2–4 | **not started** — all findings still open |
 
 The toolchain is installed and a full clean build has been verified on this
 machine, producing `play/RP2040/build/grblHAL.uf2` (447 KB, family
@@ -40,6 +70,9 @@ cd "/c/Users/David Lyman Dawes/play"
 ./build.sh            # incremental
 ./build.sh clean      # wipe build dir first
 ```
+
+Nothing has been flashed or run. Everything below is verified as *builds
+correctly*, not as *works on a machine*.
 
 Everything below documents how that was set up and, more importantly, the three
 things that went wrong so they can be recognised again.
@@ -204,11 +237,87 @@ See §2.4 for why standing up a host-side build would still be worth the effort 
 none of the above lets the core be tested without hardware in the loop.
 
 ---
+## 1.7 Continuous integration
 
-# Part 2 — Code review findings
+`.github/workflows/build.yml` runs on every pull request, every push to
+`master`, and on demand via *Actions → build → Run workflow*.
 
-Reviewed at commit `516e5ad` on `master`. This tree is an unmodified clone of upstream
-`grblHAL/core`, so these belong upstream rather than as local patches.
+### What it does
+
+Because the core has no `main()` and its `CMakeLists.txt` only declares an
+`INTERFACE` library, CI builds it the only way it can be built — as part of a
+real driver. Each job:
+
+1. Checks out this repository.
+2. Installs Arm GNU Toolchain 14.2.rel1 and the Pico SDK 2.1.1 (both cached
+   between runs, so a warm run skips ~500 MB of downloads).
+3. Applies the `pioasm` `<cstdint>` patch from §1.5(b).
+4. Clones the grblHAL RP2040 driver with its submodules, then **deletes the
+   driver's pinned `grbl` submodule and substitutes this checkout** — so what
+   gets compiled is the PR's code, not upstream's.
+5. Configures and builds, then verifies the firmware image and reports its size.
+6. Uploads `grblHAL.uf2` and `grblHAL.elf` as build artifacts (14 day retention).
+
+### The matrix
+
+Six configurations, `fail-fast: false` so one failure doesn't mask the others:
+
+| Job | Board | Extra defines |
+|---|---|---|
+| `pico2-generic-3axis` | `pico2` | — |
+| `pico-generic-3axis` | `pico` | — |
+| `pico2-generic-4axis` | `pico2` | `BOARD_GENERIC_4AXIS` |
+| `pico2-generic-8axis` | `pico2` | `BOARD_GENERIC_8AXIS` |
+| `pico2-compat-level-1` | `pico2` | `COMPATIBILITY_LEVEL=1` |
+| `pico2-compat-level-2` | `pico2` | `COMPATIBILITY_LEVEL=2` |
+
+The matrix is the point. Every file in the core is heavily conditionally
+compiled, so a change that builds for `N_AXIS=3` / `COMPATIBILITY_LEVEL=0` can
+easily break another combination — and that is precisely the class of breakage
+this catches. It covers both MCU families (RP2040 and RP2350), the axis-count
+variations, and the compatibility levels that gate the protocol extensions.
+
+### How options are injected
+
+Two mechanisms, both verified locally before being committed:
+
+* `-DPICO_BOARD=<board>` — a cache variable in the driver's `CMakeLists.txt`,
+  so it overrides cleanly on a fresh configure.
+* `-DCMAKE_PROJECT_grblHAL_INCLUDE=inject.cmake`, where `inject.cmake` contains
+  `add_compile_definitions(...)`. This puts a real `-D` on every compile line.
+
+Two approaches that **do not** work, recorded so they aren't retried:
+
+* `-DCMAKE_C_FLAGS="-DN_AXIS=5"` clobbers the SDK's architecture flags
+  (`-mcpu=cortex-m33 -mthumb -march=armv8-m.main+fp+dsp ...`), and the build
+  then dies deep inside the SDK with
+  `#error no SW_SPIN_TRY_LOCK available for PICO_USE_SW_SPIN_LOCK`.
+* Appending `#define N_AXIS 5` to `my_machine.h` gives a redefinition error —
+  `my_machine.h` is not included before `config.h` in every translation unit.
+
+Note also that `N_AXIS` cannot simply be raised on the default map:
+`generic_map.h` rejects it with `#error "Axis configuration is not supported!"`.
+Use the dedicated `BOARD_GENERIC_4AXIS` / `BOARD_GENERIC_8AXIS` maps, as the
+matrix does.
+
+### What it does *not* do
+
+**There are no tests, so CI does not run any.** This is a build matrix plus an
+image sanity check (UF2 magic, block alignment, `arm-none-eabi-size` output) —
+nothing exercises the parser, the planner, or the stepper logic.
+
+That gap is not something CI configuration can close: there is no host-side
+build, so there is nothing to run on a runner. Item 6 in the §1.1 status table
+and §2.4 are the prerequisite. Until then, CI answers "does it still compile
+everywhere?" and nothing more.
+
+---
+
+# Part 2 — Code review findings (core)
+
+Reviewed at commit `516e5ad` on `master`. No C source in this tree has been modified
+since — only documentation and CI have been added — so every finding below still
+stands as written, and all of them are upstream issues rather than local regressions.
 
 **All findings are from reading, not from compiling or running.** File:line references are
 given so each can be confirmed.
@@ -337,3 +446,313 @@ For a codebase that moves a machine, this is the largest structural gap. See §2
   to consume them.
 * **A build matrix** over `N_AXIS` × `COMPATIBILITY_LEVEL` × kinematics, which is where
   option-combination breakage actually lives.
+
+---
+
+# Part 3 — Code review findings (RP2040 driver)
+
+Reviewed at `DavidLDawes/RP2040` commit `e34f9b6`, which matches upstream. As
+with Part 2, these are from reading, not from running. File:line references are
+relative to the driver repo.
+
+## 3.1 Confirmed defects
+
+### 1. `ioports_analog.c:227` — `pwm_values` is allocated by PWM count but indexed by port ordinal — MEDIUM
+
+The array is allocated with one slot per *PWM-capable* output:
+
+```c
+pwm_values = calloc(n_pwm, sizeof(float));
+```
+
+but it is indexed by *port ordinal* in both places it is used:
+
+```c
+:75   return pwm_values && output->id < analog.out.n_ports ? pwm_values[output->id] : -1.0f;
+:82   pwm_values[aux_out_analog[port].id - Output_Analog_Aux0] = value;
+```
+
+The bound checked is `analog.out.n_ports` (all analog outputs), not `n_pwm`. As
+soon as a board has an analog output that is not PWM-backed, `n_pwm <
+analog.out.n_ports` and line 82 writes past the end of the allocation — a heap
+overflow — while line 75 reads past it.
+
+The sibling array `pwm_data` gets this right, indexing through the dedicated
+`aux_out_analog[i].pwm_idx` (lines 83, 158) that is assigned at line 232.
+`pwm_values` should use `pwm_idx` too, or be sized `analog.out.n_ports`.
+
+Config-dependent: harmless on a board where every analog output is PWM, which is
+why it has survived.
+
+### 2. `ioports_analog.c:83` — `pwm_data` NULL check missing on the hot path — LOW/MEDIUM
+
+`analog_out()` guards `pwm_values` before writing:
+
+```c
+:81   if(pwm_values)
+:82       pwm_values[...] = value;
+:83   pwm_set_gpio_level(..., ioports_compute_pwm_value(&pwm_data[...], value));
+```
+
+but line 83 dereferences `pwm_data` unguarded. The init path *does* check it
+(`if(aux_out_analog[i].mode.pwm && !!pwm_data)`, line 231), so the author was
+aware it can be NULL. Asymmetric guard: if the `pwm_data` calloc at line 226
+fails, the first `M67` writes through NULL.
+
+Line 83 also runs for ports where `mode.pwm` is false, using a `pwm_idx` that was
+never assigned for that port.
+
+### 3. `driver.c:2478` — unbounded busy-wait with no escape — LOW (optional feature)
+
+```c
+static void _write (void)
+{
+    while(neop.busy);
+    ...
+}
+```
+
+No timeout and, unlike the I²C path, no `hal.stream_blocking_callback()` pump. If
+the NeoPixel DMA completion never lands, the controller wedges permanently and
+cannot even be soft-reset, because realtime commands stop being serviced. Only
+compiled when `NEOPIXELS_PIN` is defined.
+
+Compare `i2c.c:159`, which does the same wait correctly:
+
+```c
+while(tx.busy) {
+    if(!hal.stream_blocking_callback())
+        return false;
+}
+```
+
+### 4. `i2c.c:152` — `// TODO: add timeout handling` — LOW
+
+The author's own note, and it is a real gap: `i2c_send()` has no timeout, so a
+stuck or absent I²C device blocks. The `stream_blocking_callback()` pump means
+the machine stays responsive, so this is a hang rather than a lockup — but a
+Modbus/expander fault should fail the operation, not wait forever.
+
+## 3.2 Quality and simplicity
+
+### 5. Board selection requires editing a tracked file
+
+`CMakeLists.txt:29` — `set(PICO_BOARD pico CACHE STRING "Board type")`, with the
+comment *"Select the correct board in VSCode, the following line will be updated
+accordingly"*. Selecting a board means editing a tracked file, so every working
+tree permanently diverges from upstream and every `git pull` risks a conflict on
+that line. Our own clone carries exactly this diff today.
+
+It is already a `CACHE` variable, so `-DPICO_BOARD=pico2` on the command line
+works and was verified — CI relies on it. Leaving the tracked default alone and
+passing `-D` (or a CMake preset) removes the divergence entirely. A
+`CMakePresets.json` with one preset per board would be the tidy version and would
+also give the VS Code extension something to select.
+
+### 6. `driver.c:3286` — declaration directly after a `case` label
+
+```c
+case PinGroup_SpindleIndex:
+    uint32_t rpm_count = encoder_ovf | pwm_get_counter(encoder_pwm);
+```
+
+A label must be followed by a statement, not a declaration, before C23. GCC
+accepts it, but it is gratuitously non-portable in a codebase that targets 15+
+toolchains. Braces around the case body fix it.
+
+## 3.3 What the driver gets right
+
+Worth recording so it does not get "fixed":
+
+* Hot paths are correctly decorated with `__not_in_flash_func()` — the stepper
+  ISR, `stepperPulseStart`, `stepperCyclesPerTick`, the GPIO and systick ISRs all
+  run from RAM rather than XIP flash. This matters a great deal on RP2040/RP2350.
+* `stepperPulseStart()` is genuinely minimal: two branches and two port writes.
+* Step/dir output is done with `gpio_put_masked()` in a single write where the
+  pin map allows, rather than per-pin toggling.
+* Pin debounce is pushed to the foreground via `task_add_delayed()` rather than
+  being done with delays in the ISR.
+
+---
+
+# Part 4 — Findings that only appear when the two are combined
+
+This is the part that neither repo's own review surfaces.
+
+## 4.1 `hal.irq_disable()` / `irq_enable()` do not nest, and ISR-callable core code calls them — HIGH
+
+Part 2 §2.2(7) flagged that the HAL contract has no save/restore. The driver
+confirms it concretely:
+
+```c
+driver.c:2835   hal.irq_enable  = __enable_irq;
+driver.c:2836   hal.irq_disable = __disable_irq;
+```
+
+These are the raw CMSIS intrinsics — they clear and set `PRIMASK`
+unconditionally. There is no "restore previous state" anywhere in the chain, and
+`hal.h` does not document the constraint. The driver's own `bitsSetAtomic()`,
+`bitsClearAtomic()` and `valueSetAtomic()` (`driver.c:1976-2001`) are built the
+same way.
+
+The consequence is that the "atomic" helpers are **not atomic when nested**, and
+any core code that calls them from inside an outer critical section silently ends
+that section early.
+
+Concrete, verified call paths into these from interrupt context:
+
+| Path | Where |
+|---|---|
+| serial/USB RX ISR → `protocol_enqueue_realtime_command()` → `system_set_exec_state_flag()` → `hal.set_bits_atomic` | core `protocol.c:823` (`ISR_CODE`), `system.h:343` |
+| control signal ISR → `control_interrupt_handler()` → `system_set_exec_state_flag()` | core `system.c:84` (`ISR_CODE`) |
+| limit switch ISR → `limit_interrupt_handler()` | core `machine_limits.c:84` (`ISR_CODE`) |
+| GPIO ISR → `task_add_delayed()` → `hal.irq_disable()` / `hal.irq_enable()` | driver `driver.c:3263`, core `grbllib.c` |
+
+To be precise about severity: on Cortex-M, `__enable_irq()` inside an ISR does
+**not** re-enter the same interrupt — the NVIC blocks that until the handler
+returns. So this is not an instant crash, which is why it has never been noticed.
+The real exposure is nesting: an outer `__disable_irq()` region that calls any of
+the above loses its protection at the inner `__enable_irq()`, with no diagnostic.
+
+**Fix** — cheap and local, on the driver side:
+
+```c
+static void bitsSetAtomic (volatile uint_fast16_t *ptr, uint_fast16_t bits)
+{
+    uint32_t prim = __get_PRIMASK();
+    __disable_irq();
+    *ptr |= bits;
+    __set_PRIMASK(prim);
+}
+```
+
+and correspondingly for `hal.irq_enable`/`hal.irq_disable`, which need a
+save/restore pair in the HAL contract rather than two independent void functions.
+That is an API change in core's `hal.h`, so it touches both repos — which is
+exactly why it belongs in Part 4. At minimum, core's `hal.h` should *document*
+that these do not nest (it currently documents them backwards; Part 2 §2.2(6)).
+
+## 4.2 Pin activity can drive the stepper ISR into calling `free()` — HIGH
+
+Two findings that look survivable alone compound into something that is not.
+
+* Core allocates deferred work from a **fixed pool of 40** slots
+  (`CORE_TASK_POOL_SIZE`, `grbllib.c`). Allocation can fail.
+* The driver consumes pool slots **from the GPIO ISR** on every debounced pin
+  edge (`driver.c:3263`, `task_add_delayed(pin_debounce, input, 40)`).
+* Core's stepper ISR, when `task_add_immediate()` fails because the pool is
+  exhausted, calls **`free()` from interrupt context** (`stepper.c:524`,
+  Part 2 §2.1(2)).
+
+So the chain is: a chattering limit switch or a noisy aux input floods the GPIO
+ISR → the 40-slot pool drains → the next motion-synchronised message in the
+stepper ISR fails to enqueue → `free()` runs inside a ~300 kHz interrupt handler
+→ heap corruption if the foreground happened to be inside `malloc`/`free`.
+
+Electrical noise on an input is exactly the condition under which you least want
+heap corruption. Neither repo's code looks wrong on its own; the coupling is
+invisible unless you read both.
+
+Mitigations, cheapest first:
+
+1. Make `stepper.c:524` leak the message instead of freeing it in the ISR. One
+   line, removes the dangerous outcome entirely.
+2. Have the driver degrade more gracefully when `task_add_delayed()` fails —
+   currently it silently falls through to handling the edge inline *without*
+   debounce and without disabling the IRQ, which under a pin storm is the worst
+   moment to stop debouncing.
+3. Consider whether 40 slots is right when a single noisy input can consume them,
+   and/or reserve a slot class for the stepper path.
+
+## 4.3 CI now builds the fork, not upstream
+
+`.github/workflows/build.yml` clones `DavidLDawes/RP2040` (`DRIVER_REPO`), so
+driver-side fixes are exercised by core CI before they go anywhere near upstream.
+Both halves of the firmware are therefore under test together.
+
+The matrix does not yet build the driver's *own* PRs — that would need a matching
+workflow in the driver repo pointing back at `DavidLDawes/core`. Worth adding
+once driver changes actually start.
+
+---
+
+# Part 5 — Where to start, and how to progress
+
+Ordered so that each step makes the next one cheaper or safer. Everything in
+Parts 2–4 is still open.
+
+### Step 1 — Land the two one-line safety fixes (half a day)
+
+Do these first because they are small, independently verifiable, and remove the
+two worst outcomes in the whole list.
+
+1. **`stepper.c:524`** — stop calling `free()` in the stepper ISR; leak the
+   message instead. Kills §4.2's bad ending outright.
+2. **`settings.c:3227`** — fix the `realloc` failure path so one OOM cannot
+   permanently poison `setting_get_description()` into a NULL dereference
+   (Part 2 §2.1(1)).
+
+Both are in core, both are contained, and CI already proves they compile across
+six configurations. This is also a good calibration exercise for the workflow:
+branch on `DavidLDawes/core`, PR, watch CI, merge.
+
+### Step 2 — Stand up the host-side build (the unlock)
+
+The single highest-leverage item on the list, and the reason to do it before the
+larger fixes. `planner.c:285` already refers to "the grblHAL simulator", so the
+idea has precedent.
+
+A stub implementing the `hal` contract — enough to link `grbl_enter()` on a PC —
+would:
+
+* turn the CI you now have from a *compile* check into an actual *test* suite;
+* let every remaining finding be demonstrated with a failing test before the fix
+  and a passing one after, instead of argued from code reading;
+* make the parser and NGC expression evaluator fuzzable (Part 2 §2.4), which is
+  where malformed-input bugs will be;
+* remove the "verified as builds, not as runs" caveat that currently applies to
+  everything here.
+
+Scope it small: no motion, no timers, a null stream, and enough of `hal` to get
+`gc_execute_block()` and `plan_buffer_line()` callable. Everything else can grow
+later.
+
+### Step 3 — Fix the interrupt-nesting contract (§4.1)
+
+Needs both repos, which is why it comes after the harness exists.
+
+1. In core, change `hal.h` so the contract is a save/restore pair rather than two
+   independent voids, and fix the swapped Doxygen comments (Part 2 §2.2(6)).
+2. In the driver, implement it with `__get_PRIMASK()` / `__set_PRIMASK()` and fix
+   the three `*Atomic` helpers the same way.
+3. Note it in `changelog.md` — it is an ABI change for every other driver.
+
+This is the change most likely to need real hardware to trust, which is the next
+argument for Step 4.
+
+### Step 4 — Get a Pico 2 and actually run it
+
+Everything so far is verified as *builds correctly*, never as *works*. A $5 board
+converts the whole exercise from static review to something testable, and is a
+prerequisite for trusting Step 3. §1.4 has the flashing procedure.
+
+### Step 5 — The driver defects (Part 3)
+
+`ioports_analog.c`'s `pwm_values` indexing (§3.1(1)) is the real one; it needs a
+board with a non-PWM analog output to bite, so pair it with a CI matrix entry for
+such a board rather than fixing it blind. The NeoPixel busy-wait and the I²C
+timeout TODO are reliability polish.
+
+### Step 6 — Performance work (Part 2 §2.3)
+
+Deliberately last. Every item — the `steps_per_mm` reciprocal cache, hoisting the
+AMASS shift out of the ISR, the task-pool free list — is a change to hot,
+hard-real-time code, and none should be attempted without the harness from Step 2
+and hardware from Step 4 to measure against. Optimising a 300 kHz ISR on the
+strength of code reading alone is how jitter bugs get introduced.
+
+### Not recommended yet
+
+Upstreaming anything to `grblHAL/*`. Build the case with tests and hardware
+results first; a PR to a maintained project lands far better with a reproduction
+than with a code-reading argument.
