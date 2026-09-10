@@ -27,7 +27,19 @@ on a Pi.
   PicoBOB, PicoCNC, BTT SKR Pico, PicoHAL. These have board maps already in the driver
   (see `my_machine.h`, §1.3).
 
-## 1.1 Status: working as of 2026-09-10
+## 1.1 Status
+
+Last updated 2026-09-10.
+
+| # | Item | Status |
+|---|---|---|
+| 1 | Local cross-compilation toolchain (§1.2) | **done** |
+| 2 | Clean build → `grblHAL.uf2` for Pico 2 (§1.3) | **done** |
+| 3 | Working notes: `CLAUDE.md`, `README.md`, `PLAN.md` | **done**, merged in PR #1 |
+| 4 | GitHub Actions build matrix on PRs and merges (§1.7) | **done** |
+| 5 | Flash and run on real hardware (§1.4) | **not started** — no board yet |
+| 6 | Host-side build so the core can be tested without hardware (§2.4) | **not started** |
+| 7 | Any Part 2 code fix | **not started** — all findings still open |
 
 The toolchain is installed and a full clean build has been verified on this
 machine, producing `play/RP2040/build/grblHAL.uf2` (447 KB, family
@@ -40,6 +52,9 @@ cd "/c/Users/David Lyman Dawes/play"
 ./build.sh            # incremental
 ./build.sh clean      # wipe build dir first
 ```
+
+Nothing has been flashed or run. Everything below is verified as *builds
+correctly*, not as *works on a machine*.
 
 Everything below documents how that was set up and, more importantly, the three
 things that went wrong so they can be recognised again.
@@ -204,11 +219,87 @@ See §2.4 for why standing up a host-side build would still be worth the effort 
 none of the above lets the core be tested without hardware in the loop.
 
 ---
+## 1.7 Continuous integration
+
+`.github/workflows/build.yml` runs on every pull request, every push to
+`master`, and on demand via *Actions → build → Run workflow*.
+
+### What it does
+
+Because the core has no `main()` and its `CMakeLists.txt` only declares an
+`INTERFACE` library, CI builds it the only way it can be built — as part of a
+real driver. Each job:
+
+1. Checks out this repository.
+2. Installs Arm GNU Toolchain 14.2.rel1 and the Pico SDK 2.1.1 (both cached
+   between runs, so a warm run skips ~500 MB of downloads).
+3. Applies the `pioasm` `<cstdint>` patch from §1.5(b).
+4. Clones the grblHAL RP2040 driver with its submodules, then **deletes the
+   driver's pinned `grbl` submodule and substitutes this checkout** — so what
+   gets compiled is the PR's code, not upstream's.
+5. Configures and builds, then verifies the firmware image and reports its size.
+6. Uploads `grblHAL.uf2` and `grblHAL.elf` as build artifacts (14 day retention).
+
+### The matrix
+
+Six configurations, `fail-fast: false` so one failure doesn't mask the others:
+
+| Job | Board | Extra defines |
+|---|---|---|
+| `pico2-generic-3axis` | `pico2` | — |
+| `pico-generic-3axis` | `pico` | — |
+| `pico2-generic-4axis` | `pico2` | `BOARD_GENERIC_4AXIS` |
+| `pico2-generic-8axis` | `pico2` | `BOARD_GENERIC_8AXIS` |
+| `pico2-compat-level-1` | `pico2` | `COMPATIBILITY_LEVEL=1` |
+| `pico2-compat-level-2` | `pico2` | `COMPATIBILITY_LEVEL=2` |
+
+The matrix is the point. Every file in the core is heavily conditionally
+compiled, so a change that builds for `N_AXIS=3` / `COMPATIBILITY_LEVEL=0` can
+easily break another combination — and that is precisely the class of breakage
+this catches. It covers both MCU families (RP2040 and RP2350), the axis-count
+variations, and the compatibility levels that gate the protocol extensions.
+
+### How options are injected
+
+Two mechanisms, both verified locally before being committed:
+
+* `-DPICO_BOARD=<board>` — a cache variable in the driver's `CMakeLists.txt`,
+  so it overrides cleanly on a fresh configure.
+* `-DCMAKE_PROJECT_grblHAL_INCLUDE=inject.cmake`, where `inject.cmake` contains
+  `add_compile_definitions(...)`. This puts a real `-D` on every compile line.
+
+Two approaches that **do not** work, recorded so they aren't retried:
+
+* `-DCMAKE_C_FLAGS="-DN_AXIS=5"` clobbers the SDK's architecture flags
+  (`-mcpu=cortex-m33 -mthumb -march=armv8-m.main+fp+dsp ...`), and the build
+  then dies deep inside the SDK with
+  `#error no SW_SPIN_TRY_LOCK available for PICO_USE_SW_SPIN_LOCK`.
+* Appending `#define N_AXIS 5` to `my_machine.h` gives a redefinition error —
+  `my_machine.h` is not included before `config.h` in every translation unit.
+
+Note also that `N_AXIS` cannot simply be raised on the default map:
+`generic_map.h` rejects it with `#error "Axis configuration is not supported!"`.
+Use the dedicated `BOARD_GENERIC_4AXIS` / `BOARD_GENERIC_8AXIS` maps, as the
+matrix does.
+
+### What it does *not* do
+
+**There are no tests, so CI does not run any.** This is a build matrix plus an
+image sanity check (UF2 magic, block alignment, `arm-none-eabi-size` output) —
+nothing exercises the parser, the planner, or the stepper logic.
+
+That gap is not something CI configuration can close: there is no host-side
+build, so there is nothing to run on a runner. Item 6 in the §1.1 status table
+and §2.4 are the prerequisite. Until then, CI answers "does it still compile
+everywhere?" and nothing more.
+
+---
 
 # Part 2 — Code review findings
 
-Reviewed at commit `516e5ad` on `master`. This tree is an unmodified clone of upstream
-`grblHAL/core`, so these belong upstream rather than as local patches.
+Reviewed at commit `516e5ad` on `master`. No C source in this tree has been modified
+since — only documentation and CI have been added — so every finding below still
+stands as written, and all of them are upstream issues rather than local regressions.
 
 **All findings are from reading, not from compiling or running.** File:line references are
 given so each can be confirmed.
