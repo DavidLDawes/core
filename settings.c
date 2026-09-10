@@ -3224,7 +3224,19 @@ FLASHMEM const char *setting_get_description (setting_id_t id)
                             const char *v = uitoa((id - setting->id) / (setting->flags.subgroups ? setting->flags.increment : 1) + 1);
                             size_t len = strlen(description) + strlen(v) + 1;
 
-                            if(len < buflen || (buf = realloc(buf, (buflen = len)))) {
+                            // NOTE: realloc() returns NULL without freeing the original block on failure,
+                            // so assign via a temporary. Committing buf and buflen only on success keeps
+                            // buflen from claiming space buf does not have, which would otherwise leave
+                            // buf NULL while len < buflen on a later call - dereferenced below.
+                            if(len >= buflen) {
+                                char *newbuf;
+                                if((newbuf = realloc(buf, len))) {
+                                    buf = newbuf;
+                                    buflen = len;
+                                }
+                            }
+
+                            if(buf && len <= buflen) {
                                 *buf = '\0';
                                 if(description != s)
                                     strlcpy(buf, description, s - description + 1);
