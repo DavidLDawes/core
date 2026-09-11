@@ -206,10 +206,14 @@ Violating these produces intermittent, field-only failures — hold the line on 
   `malloc()` / `free()` / `realloc()`.
 * Hand deferred work to the foreground with `task_add_immediate()` and check the return
   value.
-* `hal.irq_disable()` / `hal.irq_enable()` do **not** save and restore the interrupt
-  mask — they are unconditional. They therefore do not nest: an inner pair re-enables
-  interrupts for the outer critical section too. Keep the regions short, non-nested, and
-  never call an unknown handler chain from inside one.
+* `hal.irq_disable()` / `hal.irq_enable()` are a **save/restore pair**: `irq_disable()`
+  saves the current interrupt mask and disables, `irq_enable()` restores what was saved.
+  They nest, and calls must be balanced. This matters because core code calls them from
+  interrupt context (`task_add_immediate()`, `task_add_delayed()`), where unconditionally
+  enabling would drop the mask of whatever critical section was active. Keep the regions
+  short and never call an unknown handler chain from inside one.
+  Drivers predating this contract wired these straight to `__enable_irq`/`__disable_irq`;
+  that is a bug, not a supported variant.
 * Handlers documented "Called from interrupt context" in `core_handlers.h`
   (`on_cycle_start`, `on_control_signals_changed`, `on_unknown_realtime_cmd`, `on_reset`,
   `on_jog_cancel`, `on_toolchange_ack`, `on_port_out`) bind the same rules onto every

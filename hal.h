@@ -635,10 +635,22 @@ typedef struct {
     */
     uint_fast16_t (*set_value_atomic)(volatile uint_fast16_t *value, uint_fast16_t bits);
 
-    //! \brief Optional handler to disable global interrupts.
+    /*! \brief Optional handler to leave a critical section, restoring the interrupt
+    enable state saved by the matching _irq_disable()_ call.
+
+    __NOTE:__ this must _restore_ the previous state, not unconditionally enable
+    interrupts. Core code calls _irq_disable()_/_irq_enable()_ from interrupt context
+    (see \ref task_add_immediate), so a handler that simply enables would drop the
+    interrupt mask of whatever critical section it was called from.
+    */
     void (*irq_enable)(void);
 
-    //! \brief Optional handler to enable global interrupts.
+    /*! \brief Optional handler to enter a critical section by disabling global interrupts,
+    saving the previous interrupt enable state for the matching _irq_enable()_ call.
+
+    Calls must be balanced, and implementations are expected to nest: an inner
+    _irq_disable()_/_irq_enable()_ pair must leave the outer critical section intact.
+    */
     void (*irq_disable)(void);
 
     //! \brief Optional handler for claiming higher level interrupts. Set to a dummy handler on startup.

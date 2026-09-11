@@ -77,7 +77,8 @@ Last updated 2026-09-10.
 | 8 | Host-side build so the core can be tested without hardware (§1.8) | **done** — 21 tests, run in CI |
 | 9 | Part 5 Step 1 — the two HIGH core safety fixes | **done** — §2.1(1) and §2.1(2) |
 | 10 | Part 5 Step 2 — host simulator and regression suite (§1.8) | **done** |
-| 11 | Remaining code fixes from Parts 2–4 | **not started** |
+| 11 | Part 5 Step 3 — interrupt-nesting contract (§4.1) | **done** — both repos |
+| 12 | Remaining code fixes from Parts 2–4 | **not started** |
 
 The toolchain is installed and a full clean build has been verified on this
 machine, producing `play/RP2040/build/grblHAL.uf2` (447 KB, family
@@ -508,12 +509,12 @@ already used elsewhere in the tree.
 
 ## 2.2 Design and documentation
 
-### 6. `hal.h:638-641` — Doxygen comments swapped — LOW but public
+### 6. `hal.h:638-641` — Doxygen comments swapped — LOW but public — **FIXED**
 
 `irq_enable` is documented as "Optional handler to **disable** global interrupts" and
 `irq_disable` as "...**enable**...". This is driver-author-facing generated API docs.
 
-### 7. `hal.irq_disable()` / `irq_enable()` don't save and restore the mask — MEDIUM
+### 7. `hal.irq_disable()` / `irq_enable()` don't save and restore the mask — MEDIUM — **FIXED**
 
 They are unconditional, so they don't nest: an inner pair re-enables interrupts for the
 outer critical section too. Functions marked `ISR_CODE` and documented ISR-callable
@@ -702,7 +703,7 @@ Worth recording so it does not get "fixed":
 
 This is the part that neither repo's own review surfaces.
 
-## 4.1 `hal.irq_disable()` / `irq_enable()` do not nest, and ISR-callable core code calls them — HIGH
+## 4.1 `hal.irq_disable()` / `irq_enable()` do not nest, and ISR-callable core code calls them — HIGH — **FIXED**
 
 Part 2 §2.2(7) flagged that the HAL contract has no save/restore. The driver
 confirms it concretely:
@@ -840,7 +841,7 @@ Scope it small: no motion, no timers, a null stream, and enough of `hal` to get
 `gc_execute_block()` and `plan_buffer_line()` callable. Everything else can grow
 later.
 
-### Step 3 — Fix the interrupt-nesting contract (§4.1) — **NEXT**
+### Step 3 — Fix the interrupt-nesting contract (§4.1) — **DONE**
 
 Needs both repos, which is why it comes after the harness exists.
 
@@ -853,7 +854,7 @@ Needs both repos, which is why it comes after the harness exists.
 This is the change most likely to need real hardware to trust, which is the next
 argument for Step 4.
 
-### Step 4 — Get a Pico 2 and actually run it
+### Step 4 — Get a Pico 2 and actually run it — **NEXT**
 
 Everything so far is verified as *builds correctly*, never as *works*. A $5 board
 converts the whole exercise from static review to something testable, and is a
