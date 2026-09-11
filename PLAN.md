@@ -74,9 +74,10 @@ Last updated 2026-09-10.
 | 5 | Review of the RP2040 driver (Part 3) | **done** |
 | 6 | Review of the core + driver combination (Part 4) | **done** |
 | 7 | Flash and run on real hardware (§1.4) | **not started** — no board yet |
-| 8 | Host-side build so the core can be tested without hardware (§2.4) | **not started** |
+| 8 | Host-side build so the core can be tested without hardware (§1.8) | **done** — 21 tests, run in CI |
 | 9 | Part 5 Step 1 — the two HIGH core safety fixes | **done** — §2.1(1) and §2.1(2) |
-| 10 | Remaining code fixes from Parts 2–4 | **not started** |
+| 10 | Part 5 Step 2 — host simulator and regression suite (§1.8) | **done** |
+| 11 | Remaining code fixes from Parts 2–4 | **not started** |
 
 The toolchain is installed and a full clean build has been verified on this
 machine, producing `play/RP2040/build/grblHAL.uf2` (447 KB, family
@@ -332,6 +333,103 @@ That gap is not something CI configuration can close: there is no host-side
 build, so there is nothing to run on a runner. Item 6 in the §1.1 status table
 and §2.4 are the prerequisite. Until then, CI answers "does it still compile
 everywhere?" and nothing more.
+
+## 1.8 The host simulator and regression suite
+
+`test/` builds the core as an ordinary PC program and runs a regression suite
+against it. This is the only place core code is actually **executed** rather than
+just compiled, and it needs no hardware.
+
+```bash
+cmake -G Ninja -S test -B build-sim
+cmake --build build-sim
+bash test/run_tests.sh build-sim/grbl_sim
+```
+
+CI runs exactly this as the `host-tests` job on every PR and merge.
+
+### What it is
+
+* `test/sim_driver.c` — a host "driver" implementing enough of the HAL contract to
+  link and run `grbl_enter()`. Input comes from stdin, output goes to stdout.
+* `test/CMakeLists.txt` — reuses the core's own `CMakeLists.txt` source list, so a
+  file added there is picked up automatically.
+* `test/run_tests.sh` — 21 cases covering startup, g-code parsing, modal state,
+  reporting and setting descriptions.
+
+It is deliberately **not** a machine simulator. Steps are counted, not timed, and
+nothing runs from an interrupt. That is enough for the parser, planner, settings
+and protocol layers, and it keeps the harness small. Anything about timing, step
+generation or interrupt behaviour still needs a board — so Part 4's findings in
+particular remain untestable here.
+
+### Things that had to be got right
+
+Each of these cost a debugging cycle and would cost another if the harness is
+ever rewritten.
+
+**The stream must filter realtime commands.** A real driver calls
+`enqueue_realtime_command()` on every received byte in its RX interrupt handler
+and only passes the rest to the line buffer. The first version of the harness
+returned raw bytes, so `CMD_EXIT` reached the line parser as data, was stripped as
+a control character, and the process spun forever.
+
+**The harness must never be able to hang CI.** `streamGetC()` injects `CMD_EXIT`
+on *every* starved read, not once — a soft reset re-enters the main loop, and a
+one-shot injection leaves the core spinning on an empty stream. On top of that a
+counter aborts with a diagnostic and exit code 2 after `SIM_MAX_STARVED_READS`
+polls, so a future regression fails loudly instead of burning a CI runner.
+`run_tests.sh` also wraps every case in `timeout`.
+
+**Driver capabilities are checked at startup.** `grbl_enter()` raises ALARM:16
+(`Alarm_SelftestFailed`) unless the driver claims everything the core was built to
+expect. Two matter here: `amass_level` must equal `MAX_AMASS_LEVEL`, and
+`step_pulse_delay` must be set because `config.h` always defines
+`DEFAULT_STEP_PULSE_DELAY`.
+
+**One case per process.** With `COMPATIBILITY_LEVEL 0` the core stops parsing
+after a failed block and simply repeats the last error until reset, so cases
+sharing a process contaminate each other.
+
+**glibc before 2.38 has no `strlcpy`.** The core uses it; CMake probes for it and
+the harness supplies it when missing.
+
+### A portability note, not a bug
+
+The harness does not link with MinGW on Windows: `mc_rigid_tapping` is declared
+`__attribute__((weak))` and PE/COFF does not resolve weak symbols the way ELF
+does. It links and runs correctly on Linux, which is where CI runs it. To run it
+locally from Windows, use a container:
+
+```bash
+docker run --rm -v "/c/Users/David Lyman Dawes/play/core:/src" -w /src \
+    grblsim-dev bash -c 'cmake -G Ninja -S test -B /tmp/b && ninja -C /tmp/b \
+                         && bash test/run_tests.sh /tmp/b/grbl_sim'
+```
+
+where `grblsim-dev` is `debian:bookworm-slim` plus `build-essential cmake
+ninja-build`.
+
+### What it does and does not cover
+
+It covers the parser, modal state, settings, reporting and the protocol loop —
+the layers where most regressions land, and where nothing could previously be
+checked at all.
+
+It does **not** cover the two fixes from Step 1 in the way one would hope:
+
+* The `free()`-in-ISR path (§2.1(2)) only triggers when the task pool is
+  exhausted, which the harness has no way to force.
+* The `realloc` failure path (§2.1(1)) needs an allocation failure *and* an
+  incrementing setting whose description contains a `?` placeholder. Only one core
+  description contains `?` and it is not an incrementing setting, so **that branch
+  is unreachable in a core-only build** — it exists for drivers and plugins that
+  register such settings.
+
+What the suite does do for those fixes is guard the *ordinary* path: the
+`$SED=100/101/102` cases would catch a rewrite that broke normal description
+lookup. Fault injection for the failure paths would need a malloc shim and a
+test-only setting, which is a reasonable next increment but was not built here.
 
 ---
 
@@ -706,7 +804,7 @@ once driver changes actually start.
 Ordered so that each step makes the next one cheaper or safer. Everything in
 Parts 2–4 is still open.
 
-### Step 1 — Land the two one-line safety fixes (half a day)
+### Step 1 — Land the two one-line safety fixes — **DONE**
 
 Do these first because they are small, independently verifiable, and remove the
 two worst outcomes in the whole list.
@@ -721,7 +819,7 @@ Both are in core, both are contained, and CI already proves they compile across
 six configurations. This is also a good calibration exercise for the workflow:
 branch on `DavidLDawes/core`, PR, watch CI, merge.
 
-### Step 2 — Stand up the host-side build (the unlock)
+### Step 2 — Stand up the host-side build (the unlock) — **DONE**, see §1.8
 
 The single highest-leverage item on the list, and the reason to do it before the
 larger fixes. `planner.c:285` already refers to "the grblHAL simulator", so the
@@ -742,7 +840,7 @@ Scope it small: no motion, no timers, a null stream, and enough of `hal` to get
 `gc_execute_block()` and `plan_buffer_line()` callable. Everything else can grow
 later.
 
-### Step 3 — Fix the interrupt-nesting contract (§4.1)
+### Step 3 — Fix the interrupt-nesting contract (§4.1) — **NEXT**
 
 Needs both repos, which is why it comes after the harness exists.
 
