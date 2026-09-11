@@ -28,6 +28,26 @@ env:
   DRIVER_REF: main
 
 jobs:
+  # Builds the core as an ordinary PC program against the host simulator in
+  # test/, then runs the regression suite. This is the only job here that
+  # actually *executes* core code rather than just compiling it.
+  test:
+    name: host-tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out core
+        uses: actions/checkout@v7
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Build the simulator
+        run: cmake -G Ninja -S test -B build-sim && cmake --build build-sim
+
+      - name: Run regression tests
+        run: bash test/run_tests.sh build-sim/grbl_sim
+
   build:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest

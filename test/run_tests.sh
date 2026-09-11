@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+#
+# Regression tests for the grblHAL core, run against the host simulator.
+#
+#   ./run_tests.sh [path-to-grbl_sim]
+#
+# Each case runs in a fresh process. That is deliberate: with
+# COMPATIBILITY_LEVEL 0 the core stops parsing after a failed block and simply
+# repeats the last error, so cases sharing a process would contaminate each
+# other.
+
+set -uo pipefail
+
+SIM="${1:-build/grbl_sim}"
+TIMEOUT="${TIMEOUT:-20}"
+
+if [ ! -x "$SIM" ]; then
+    echo "run_tests.sh: no simulator at '$SIM'" >&2
+    echo "build it with: cmake -G Ninja -S . -B build && ninja -C build" >&2
+    exit 2
+fi
+
+pass=0
+fail=0
+
+# check <name> <input> <expected-regex> [more-regexes...]
+check () {
+    local name="$1" input="$2"; shift 2
+    local out rc problem=""
+
+    out=$(printf '%b' "$input" | timeout "$TIMEOUT" "$SIM" 2>&1)
+    rc=$?
+
+    if [ $rc -eq 124 ]; then
+        problem="timed out after ${TIMEOUT}s"
+    elif [ $rc -ne 0 ]; then
+        problem="exit code $rc"
+    else
+        local re
+        for re in "$@"; do
+            if ! printf '%s' "$out" | grep -qE -- "$re"; then
+                problem="missing /$re/"
+                break
+            fi
+        done
+    fi
+
+    if [ -z "$problem" ]; then
+        printf '  ok    %s\n' "$name"
+        pass=$((pass + 1))
+    else
+        printf '  FAIL  %s (%s)\n' "$name" "$problem"
+        printf '%s\n' "$out" | sed 's/^/          | /'
+        fail=$((fail + 1))
+    fi
+}
+
+# check_absent <name> <input> <regex-that-must-not-appear>
+check_absent () {
+    local name="$1" input="$2" re="$3"
+    local out rc
+
+    out=$(printf '%b' "$input" | timeout "$TIMEOUT" "$SIM" 2>&1)
+    rc=$?
+
+    if [ $rc -eq 124 ]; then
+        printf '  FAIL  %s (timed out after %ss)\n' "$name" "$TIMEOUT"
+        fail=$((fail + 1))
+    elif printf '%s' "$out" | grep -qE -- "$re"; then
+        printf '  FAIL  %s (unexpected /%s/)\n' "$name" "$re"
+        printf '%s\n' "$out" | sed 's/^/          | /'
+        fail=$((fail + 1))
+    else
+        printf '  ok    %s\n' "$name"
+        pass=$((pass + 1))
+    fi
+}
+
+echo "grblHAL core regression tests ($SIM)"
+echo
+
+echo "startup"
+check        "banner is printed"            ""  "GrblHAL .* for help"
+check_absent "boots without an alarm"       ""  "ALARM:"
+check_absent "boots without an error"       ""  "error:"
+
+echo
+echo "g-code parsing"
+check "rapid is accepted"                   "G0X10Y5\n"                 "^ok"
+check "feed move with F is accepted"        "G1X10F100\n"               "^ok"
+check "feed move without F is rejected"     "G1X10\n"                   "error:22"
+check "several blocks all accepted"         "G21\nG90\nG0X1\nG0Y2\n"    "ok" "ok" "ok" "ok"
+check "arc is accepted"                     "G17\nG2X10Y0I5J0F100\n"    "^ok"
+
+echo
+echo "modal state"
+check "G21/G90 are reported by \$G"         "G21\nG90\n\$G\n"           "\[GC:.*G21.*G90"
+check "feed rate is retained"               "G1X1F250\n\$G\n"           "\[GC:.*F250"
+check "G20 switches to inches"              "G20\n\$G\n"                "\[GC:.*G20"
+
+echo
+echo "reporting"
+check "status report responds"              "?\n"                       "<Idle\|MPos:0.000,0.000,0.000"
+check "settings dump includes \$0"          "\$\$\n"                    "^\\\$0="
+check "settings dump includes axis steps"   "\$\$\n"                    "^\\\$100="
+check "build info responds"                 "\$I\n"                     "\[VER:"
+
+# setting_get_description() rebuilds per-axis descriptions through a realloc'd
+# static buffer. These guard the rewrite of that failure path (PLAN.md 2.1(1))
+# against breaking the ordinary path.
+echo
+echo "setting descriptions"
+check "description for \$100"               "\$SED=100\n"               "\[SETTINGDESCR:100\|"
+check "description for \$101"               "\$SED=101\n"               "\[SETTINGDESCR:101\|"
+check "description for \$102"               "\$SED=102\n"               "\[SETTINGDESCR:102\|"
+check "description for a non-axis setting"  "\$SED=110\n"               "\[SETTINGDESCR:110\|"
+
+echo
+echo "shutdown"
+check "exits cleanly on end of input"       ""                          "GrblHAL"
+check "exits cleanly after g-code"          "G0X1\n"                    "^ok"
+
+echo
+printf '%d passed, %d failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]
