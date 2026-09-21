@@ -44,3 +44,6 @@ build
 
 # Host simulator build output (test/)
 build-sim
+
+# Python bytecode from test/ scripts
+__pycache__/

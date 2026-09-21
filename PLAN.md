@@ -63,26 +63,28 @@ on a Pi.
 
 ## 1.1 Status
 
-Last updated 2026-09-10.
+Last updated 2026-09-21.
 
 | # | Item | Status |
 |---|---|---|
 | 1 | Local cross-compilation toolchain (§1.2) | **done** |
-| 2 | Clean build → `grblHAL.uf2` for Pico 2 (§1.3) | **done** |
+| 2 | Clean build → `grblHAL.uf2` for RP2040 and Pico 2 (§1.3) | **done** |
 | 3 | Working notes: `CLAUDE.md`, `README.md`, `PLAN.md` | **done**, merged in PR #1 |
 | 4 | GitHub Actions build matrix on PRs and merges (§1.7) | **done**, all 6 jobs green |
 | 5 | Review of the RP2040 driver (Part 3) | **done** |
 | 6 | Review of the core + driver combination (Part 4) | **done** |
-| 7 | Flash and run on real hardware (§1.4) | **not started** — no board yet |
+| 7 | Flash and run on real hardware (§1.4, §1.9) | **done** — RP2040 Pico; 21/21 on the board, stress test passes |
 | 8 | Host-side build so the core can be tested without hardware (§1.8) | **done** — 21 tests, run in CI |
 | 9 | Part 5 Step 1 — the two HIGH core safety fixes | **done** — §2.1(1) and §2.1(2) |
 | 10 | Part 5 Step 2 — host simulator and regression suite (§1.8) | **done** |
 | 11 | Part 5 Step 3 — interrupt-nesting contract (§4.1) | **done** — both repos |
-| 12 | Remaining code fixes from Parts 2–4 | **not started** |
+| 12 | Part 5 Step 4 — run on hardware (§1.4, §1.9) | **done** |
+| 13 | Remaining code fixes from Parts 2–4 | **not started** |
 
 The toolchain is installed and a full clean build has been verified on this
-machine, producing `play/RP2040/build/grblHAL.uf2` (447 KB, family
-`0xE48BFF59` = `rp2350-arm-s`, correct for a Pico 2).
+machine, producing `play/RP2040/build/grblHAL.uf2`. `build.sh` now defaults to the
+RP2040 (UF2 family `0xE48BFF56`) to match the bench board; `PICO_BOARD=pico2`
+builds for a Pico 2 (`0xE48BFF59`, `rp2350-arm-s`).
 
 **To build, from Git Bash:**
 
@@ -92,8 +94,10 @@ cd "/c/Users/David Lyman Dawes/play"
 ./build.sh clean      # wipe build dir first
 ```
 
-Nothing has been flashed or run. Everything below is verified as *builds
-correctly*, not as *works on a machine*.
+The firmware has been flashed and run on an RP2040 Pico (§1.4). The regression
+suite passes on the board as well as in the simulator, and a realtime stress test
+passes during motion (§1.9). Nothing has driven real motors or switches yet —
+the board has nothing attached.
 
 Everything below documents how that was set up and, more importantly, the three
 things that went wrong so they can be recognised again.
@@ -112,6 +116,8 @@ directory removes the lot. `play/toolchain/env.sh` sets the environment;
 | CMake | 3.31.8 | `toolchain/cmake-3.31.8-windows-x86_64/` | portable zip from Kitware |
 | Ninja | 1.13.2 | `toolchain/ninja.exe` | `winget install Ninja-build.Ninja` |
 | Pico SDK | 2.1.1 | `toolchain/pico-sdk/` | `git clone -b 2.1.1 --recursive` |
+| OpenOCD (RP2040/RP2350 SWD) | 0.12.0+dev | `toolchain/openocd/` | Raspberry Pi `pico-sdk-tools` release zip |
+| Python venv with pyserial | 3.5 | `toolchain/venv/` | `python -m venv` + `pip install pyserial` |
 | grblHAL RP2040 driver | main | `play/RP2040/` | `git clone --recursive` |
 
 Portable zips were used over installers deliberately: no elevation, no UAC
@@ -131,14 +137,15 @@ verified build.
 * **SDK 2.1.1**, because that is what the grblHAL RP2040 driver README pins.
 * **Host GCC 13.1**, see §1.5 — this one is not optional.
 
-## 1.3 Configuration for a Pico 2
+## 1.3 Board configuration
 
 Two files decide what gets built:
 
 * **Board selection is passed on the command line**, not edited into the driver's
   tracked `CMakeLists.txt` — that file keeps its upstream default of `pico` so the
   working tree never diverges from the fork (Part 3 §3.2). `build.sh` passes
-  `-DPICO_BOARD=pico2`; override per invocation with `PICO_BOARD=pico ./build.sh`.
+  `-DPICO_BOARD=pico` by default, matching the RP2040 on the bench (§1.4); override
+  per invocation with `PICO_BOARD=pico2 ./build.sh` for a Pico 2.
   This selects the MCU family, so getting it wrong produces link errors rather than
   a subtly wrong binary. Other valid values: `pico`, `pico_w`, `pico2_w`,
   `pimoroni_pga2350` (RP2350B_5X board).
@@ -150,21 +157,103 @@ Two files decide what gets built:
 
 ## 1.4 Flashing and first contact
 
-1. Hold **BOOTSEL** on the Pico 2 while plugging in USB.
-2. It mounts as a mass-storage volume (`RP2350`).
-3. Copy `play/RP2040/build/grblHAL.uf2` onto it. The board reboots into grblHAL.
+### The bench board is an original Pico (RP2040), not a Pico 2
 
-Then open a serial terminal on the Pico's USB CDC port — baud rate is ignored on
-native USB. Expect:
+The board connected on 2026-09-21 turned out to be an **RP2040**, which is worth
+knowing because an RP2350 build will not run on it. Two independent tells:
+
+* In BOOTSEL it enumerates as `2E8A:0003` "RP2 Boot" with a drive labelled
+  **`RPI-RP2`**, whose `INFO_UF2.TXT` reads `Model: Raspberry Pi RP2`. A Pico 2
+  is `2E8A:000F` with a drive labelled `RP2350`.
+* Over SWD it reports DPIDR `0x0bc12477` (DPv2) and two **Cortex-M0+** cores. A
+  Pico 2 is DPv3 with Cortex-M33 cores — `target/rp2350.cfg` fails on it with
+  `ADIv6 requires DPv3`.
+
+`build.sh` now defaults to `PICO_BOARD=pico` accordingly. Use
+`PICO_BOARD=pico2` for a Pico 2; CI builds both regardless.
+
+### Wiring
+
+* **The board's own micro-USB must be a data cable.** Charge-only cables are
+  common, power the board, and make it invisible to the PC. A blank board shows
+  up as a drive immediately, without pressing BOOTSEL. Nothing on a blank board
+  lights up, so there is no visual way to tell powered from dead.
+* **Raspberry Pi Debug Probe (optional but recommended):** its **D** port to the
+  board's 3-pin SWD header. It does *not* power the target. Its own UART shows
+  up as a separate COM port (COM5 here), unrelated to grblHAL.
+
+### Flashing
+
+**Over SWD — preferred.** No button presses, and verifies what it wrote:
+
+```bash
+cd "/c/Users/David Lyman Dawes/play"
+./build.sh && ./flash.sh              # PICO_BOARD=pico2 for a Pico 2
+```
+
+`flash.sh` drives OpenOCD (`toolchain/openocd`, Raspberry Pi's build from
+`pico-sdk-tools`, which carries the RP2040/RP2350 support upstream OpenOCD
+lacks) through `program … verify reset`.
+
+**Over USB — fallback.** Hold BOOTSEL while plugging in, then copy
+`RP2040/build/grblHAL.uf2` onto the `RPI-RP2` (or `RP2350`) drive.
+
+The Debug Probe's firmware is 1.0.1, which OpenOCD flags as old and works around
+at reduced performance. Updating it is worthwhile but not urgent.
+
+### First contact
+
+grblHAL appears as a USB CDC serial port — `2E8A:000A`, COM6 here. Baud rate is
+ignored. `$I` reports, among other things:
 
 ```
-GrblHAL 1.1f ['$' or '$HELP' for help]
+[VER:1.1f.20260908:]
+[DRIVER:RP2040@200MHz]
+[DRIVER OPTIONS:SDK_2.1.1]
+[NVS STORAGE:*FLASH 4K]
+[FREE MEMORY:214K]
 ```
 
-Useful first commands: `$I` (build info and enabled options), `$$` (settings),
-`$HELP`. An alarm on startup is normal and expected — grblHAL defaults to
-normally-closed switches, so with nothing wired it starts in alarm. See the note
-at the top of README.md.
+### Bench settings for a board with nothing wired
+
+It starts in `Alarm` with `Pn:XYZHSEP`: every input reads as active, because
+grblHAL assumes normally-closed switches. Invert the ones that are active. The
+values below were derived from the pins *this* board reported, not copied from
+README's generic `$14=73`, which does not match this pin map:
+
+| Setting | Meaning | Active pins | Value |
+|---|---|---|---|
+| `$5` | limit invert mask | X, Y, Z | `7` |
+| `$6` | probe invert | P | `1` |
+| `$14` | control invert mask | H (hold, 2), S (cycle start, 4), E (E-stop, 64) | `70` |
+
+The letter-to-bit mapping for `$14` is the string `"RHSDLTEOFM Q  P "` in
+`report.c` `control_signals_tostring()`. After setting these, `$X` clears the
+residual alarm and the controller reports `Idle`. **`$RST=$` restores the
+defaults**, which will be needed the moment real switches are wired.
+
+### Testing on the board
+
+The same 21-case suite that runs against the simulator runs against the board:
+
+```bash
+PYTHON="/c/Users/David Lyman Dawes/play/toolchain/venv/Scripts/python.exe" \
+    bash test/run_tests.sh --serial COM6
+```
+
+`test/serial_bridge.py` makes each hardware case start the way a simulator case
+does. Before every case it soft-resets, unlocks if needed, rapids back to machine
+zero, waits for Idle and resets again — because machine position survives a
+soft reset and cases such as the arc test depend on their start point. After the
+case it waits for motion to finish so the next reset never lands mid-move. A run
+takes about a minute, mostly real motion: the arc case alone is 15.7 mm at F100.
+
+`test/hw_rt_stress.py COM6` exercises what the regression suite cannot: realtime
+commands arriving in the RX interrupt *while the stepper interrupt is busy*. See
+§1.9 for results.
+
+pyserial lives in a venv at `toolchain/venv`, keeping it out of the system
+Python like the rest of the toolchain.
 
 ## 1.5 The three things that went wrong
 
@@ -235,27 +324,35 @@ that is the single biggest practical constraint on working here:
 **Practical consequence:** the edit/verify loop is *edit core → run
 `./build.sh`*. Incremental rebuilds after touching one core file take seconds.
 But any claim that a core change "compiles" is only true for the one option set
-that was built — here, Pico 2 / generic map / 3 axes.
+that was built — locally, RP2040 / generic map / 3 axes; CI covers six configurations (§1.7).
 
 **If you add a new `.c` file to core, add it to core's `CMakeLists.txt`** or
 CMake-based drivers will silently not link it.
 
-### Using this clone of core in the build
+### Which core the local build uses
 
-`play/RP2040/grbl/` is a git submodule pointing at `grblHAL/core`, and it
-checked out `516e5ad` — the exact commit `play/core` is on. The verified build
-used the submodule copy, not `play/core`.
+The driver's `grbl` submodule is pinned by the driver repo to an **upstream**
+`grblHAL/core` commit. Building from a plain `--recursive` clone therefore
+compiles upstream's core, *without* any of the fixes on our fork.
 
-To build against `play/core` instead, replace the submodule directory with a
-junction, from an **elevated** prompt:
+The local clone gets around that by checking the submodule out at our fork:
 
-```cmd
-rmdir /s /q "C:\Users\David Lyman Dawes\play\RP2040\grbl"
-mklink /J "C:\Users\David Lyman Dawes\play\RP2040\grbl" "C:\Users\David Lyman Dawes\play\core"
+```bash
+cd RP2040/grbl
+git remote add fork https://github.com/DavidLDawes/core.git   # once
+git fetch fork main && git checkout --detach fork/main
 ```
 
-Git will then report the submodule as modified in the driver repo. That is
-expected; just don't commit it there.
+The driver repo then reports `M grbl`. That is expected and must not be
+committed from the driver side. Re-run the fetch/checkout after merging core
+changes, or `play/core` edits will not reach the build. CI does not have this
+problem: both workflows substitute the core fork's `main` explicitly (§1.7).
+
+The durable fix is to repoint the driver fork's submodule at
+`DavidLDawes/core` in `.gitmodules` and bump the pinned commit, so a fresh
+`--recursive` clone builds our core by default. That is a deliberate
+divergence from upstream's driver, so it is listed as a follow-up in Part 5
+rather than done silently.
 
 See §2.4 for why standing up a host-side build would still be worth the effort —
 none of the above lets the core be tested without hardware in the loop.
@@ -431,6 +528,52 @@ What the suite does do for those fixes is guard the *ordinary* path: the
 `$SED=100/101/102` cases would catch a rewrite that broke normal description
 lookup. Fault injection for the failure paths would need a malloc shim and a
 test-only setting, which is a reasonable next increment but was not built here.
+
+## 1.9 Hardware results
+
+Run on 2026-09-21 against the RP2040 bench board, firmware built from `main` of
+both forks — so including every fix in Parts 2–4 marked FIXED.
+
+### Regression suite: 21 / 21
+
+The same cases and assertions as the simulator, via `serial_bridge.py`. A
+negative control — an impossible expectation added to a copy of the runner —
+correctly failed and exited 1 against the board, so a green run is meaningful.
+
+### Realtime stress during motion: pass
+
+`hw_rt_stress.py` sends a status query every ~5 ms through a 4 s move, with a
+feed hold and resume in the middle:
+
+```
+status queries sent     : 923 over 5.0s
+status reports received : 923
+state sequence          : Run -> Hold:1 -> Hold:0 -> Run -> Idle
+hold / resume at        : 1.50s / 2.08s
+final report            : <Idle|MPos:20.000,0.000,0.000|Bf:100,1023|FS:0,0>
+```
+
+Every query answered, no alarm or error, and the move finished on exactly the
+commanded position. That is roughly 150 realtime interrupts a second running
+through the §4.1 PRIMASK code concurrently with the stepper interrupt.
+
+**What that does and does not show.** It shows the §4.1 critical-section code is
+*not broken* under realistic interrupt load. It does **not** show the fix was
+*needed*: the original bug only bites when those calls nest inside an outer
+critical section, which this traffic is unlikely to produce, so the old code
+would probably have passed too. Demonstrating the bug itself would take a
+deliberately nested caller.
+
+### A false alarm worth recording
+
+The first version of the stress test sent the resume ~250 ms after the hold and
+the controller then sat in `Hold:0` indefinitely, ignoring line commands. That
+was the test, not the firmware. Cycle start is only accepted once a hold has
+**completed** (`Hold:0`); sent during deceleration (`Hold:1`) it is ignored by
+design, and at F300 with the default 10 mm/s² deceleration takes ~0.5 s. Line
+commands are deliberately not processed during a hold — they wait in the RX
+buffer. A resume sent after `Hold:0` finished the move correctly. The test now
+waits for `Hold:0`.
 
 ---
 
@@ -854,13 +997,13 @@ Needs both repos, which is why it comes after the harness exists.
 This is the change most likely to need real hardware to trust, which is the next
 argument for Step 4.
 
-### Step 4 — Get a Pico 2 and actually run it — **NEXT**
+### Step 4 — Get a board and actually run it — **DONE**, see §1.4 and §1.9
 
-Everything so far is verified as *builds correctly*, never as *works*. A $5 board
-converts the whole exercise from static review to something testable, and is a
-prerequisite for trusting Step 3. §1.4 has the flashing procedure.
+Done on an original Pico (RP2040) rather than a Pico 2. 21/21 on the board and a
+realtime stress test during motion pass. The board has nothing attached, so this
+exercises the firmware, not a machine.
 
-### Step 5 — The driver defects (Part 3)
+### Step 5 — The driver defects (Part 3) — **NEXT**
 
 `ioports_analog.c`'s `pwm_values` indexing (§3.1(1)) is the real one; it needs a
 board with a non-PWM analog output to bite, so pair it with a CI matrix entry for
@@ -874,6 +1017,21 @@ AMASS shift out of the ISR, the task-pool free list — is a change to hot,
 hard-real-time code, and none should be attempted without the harness from Step 2
 and hardware from Step 4 to measure against. Optimising a 300 kHz ISR on the
 strength of code reading alone is how jitter bugs get introduced.
+
+### Follow-ups from running on hardware
+
+* **Repoint the driver fork's `grbl` submodule at `DavidLDawes/core`.** A fresh
+  `--recursive` clone of the driver currently builds *upstream* core, without our
+  fixes; local builds work around it by hand (§1.6). Small change, but a
+  deliberate divergence from upstream's driver.
+* **Demonstrate §4.1, not just its absence of harm.** The stress test (§1.9)
+  shows the critical-section code survives load; showing the original bug needs a
+  deliberately nested caller — e.g. a test build that enters `hal.irq_disable()`,
+  triggers a path that calls `task_add_immediate()`, and checks PRIMASK after.
+* **Update the Debug Probe firmware** (1.0.1 → current). OpenOCD works around
+  the old version at reduced speed.
+* **`$RST=$` before wiring real switches.** The bench settings in §1.4 invert
+  every input; with real normally-closed switches attached they would be wrong.
 
 ### Not recommended yet
 
