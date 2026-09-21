@@ -1,23 +1,36 @@
 #!/usr/bin/env bash
 #
-# Regression tests for the grblHAL core, run against the host simulator.
+# Regression tests for the grblHAL core, run against the host simulator or
+# against real hardware over a serial port. The same cases and assertions are
+# used for both.
 #
 #   ./run_tests.sh [path-to-grbl_sim]
+#   PYTHON=python3 ./run_tests.sh --serial <port>     e.g. COM6, /dev/ttyACM0
 #
-# Each case runs in a fresh process. That is deliberate: with
-# COMPATIBILITY_LEVEL 0 the core stops parsing after a failed block and simply
-# repeats the last error, so cases sharing a process would contaminate each
-# other.
+# Each case starts from a fresh controller. For the simulator that is a fresh
+# process; on hardware serial_bridge.py soft-resets the board and returns it to
+# the origin first. That is deliberate: with COMPATIBILITY_LEVEL 0 the core
+# stops parsing after a failed block and simply repeats the last error, so cases
+# sharing state would contaminate each other.
 
 set -uo pipefail
 
-SIM="${1:-build/grbl_sim}"
-TIMEOUT="${TIMEOUT:-20}"
-
-if [ ! -x "$SIM" ]; then
-    echo "run_tests.sh: no simulator at '$SIM'" >&2
-    echo "build it with: cmake -G Ninja -S . -B build && ninja -C build" >&2
-    exit 2
+if [ "${1:-}" = "--serial" ]; then
+    port="${2:?usage: run_tests.sh --serial <port>}"
+    TARGET=("${PYTHON:-python3}" "$(dirname "$0")/serial_bridge.py" "$port")
+    LABEL="hardware on $port"
+    # Real moves take real time, and each case resets and re-homes to the origin.
+    TIMEOUT="${TIMEOUT:-90}"
+else
+    SIM="${1:-build/grbl_sim}"
+    if [ ! -x "$SIM" ]; then
+        echo "run_tests.sh: no simulator at '$SIM'" >&2
+        echo "build it with: cmake -G Ninja -S . -B build && ninja -C build" >&2
+        exit 2
+    fi
+    TARGET=("$SIM")
+    LABEL="$SIM"
+    TIMEOUT="${TIMEOUT:-20}"
 fi
 
 pass=0
@@ -28,7 +41,7 @@ check () {
     local name="$1" input="$2"; shift 2
     local out rc problem=""
 
-    out=$(printf '%b' "$input" | timeout "$TIMEOUT" "$SIM" 2>&1)
+    out=$(printf '%b' "$input" | timeout "$TIMEOUT" "${TARGET[@]}" 2>&1)
     rc=$?
 
     if [ $rc -eq 124 ]; then
@@ -60,7 +73,7 @@ check_absent () {
     local name="$1" input="$2" re="$3"
     local out rc
 
-    out=$(printf '%b' "$input" | timeout "$TIMEOUT" "$SIM" 2>&1)
+    out=$(printf '%b' "$input" | timeout "$TIMEOUT" "${TARGET[@]}" 2>&1)
     rc=$?
 
     if [ $rc -eq 124 ]; then
@@ -76,7 +89,7 @@ check_absent () {
     fi
 }
 
-echo "grblHAL core regression tests ($SIM)"
+echo "grblHAL core regression tests ($LABEL)"
 echo
 
 echo "startup"
