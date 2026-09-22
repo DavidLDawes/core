@@ -231,6 +231,75 @@ static coolant_state_t coolantGetState (void)
     return state;
 }
 
+/* --- auxiliary digital outputs ----------------------------------------------
+
+   A few fake digital outputs, so M62-M65 are accepted and the output command
+   paths in the parser, planner and stepper can be tested. Output state is just
+   recorded; nothing is driven.
+*/
+
+#ifndef SIM_N_AUX_OUT
+#define SIM_N_AUX_OUT 4
+#endif
+
+static io_ports_data_t digital;
+static bool aux_out_state[SIM_N_AUX_OUT];
+static const char *aux_out_description[SIM_N_AUX_OUT];
+
+static void digitalOut (uint8_t port, bool on)
+{
+    if(port < digital.out.n_ports)
+        aux_out_state[port] = on;
+}
+
+static float digitalOutState (xbar_t *output)
+{
+    return output->id < digital.out.n_ports ? (float)aux_out_state[output->id] : -1.0f;
+}
+
+static xbar_t *getPinInfo (io_port_direction_t dir, uint8_t port)
+{
+    static xbar_t pin;
+
+    if(dir != Port_Output || port >= digital.out.n_ports)
+        return NULL;
+
+    // Mirrors what XBAR_SET_DOUT_INFO() fills in for a real driver.
+    memset(&pin, 0, sizeof(xbar_t));
+    pin.id = port;
+    pin.mode.output = On;
+    pin.cap.mask = pin.mode.mask;
+    pin.cap.invert = On;
+    pin.cap.claimable = On;
+    pin.function = (pin_function_t)(Output_Aux0 + port);
+    pin.group = PinGroup_AuxOutput;
+    pin.pin = port;
+    pin.description = aux_out_description[port];
+    pin.get_value = digitalOutState;
+
+    return &pin;
+}
+
+static void setPinDescription (io_port_direction_t dir, uint8_t port, const char *description)
+{
+    if(dir == Port_Output && port < digital.out.n_ports)
+        aux_out_description[port] = description;
+}
+
+static void simIoportsInit (void)
+{
+    io_digital_t ports = {
+        .ports = &digital,
+        .digital_out = digitalOut,
+        .get_pin_info = getPinInfo,
+        .set_pin_description = setPinDescription
+    };
+
+    digital.out.n_ports = SIM_N_AUX_OUT;
+
+    ioports_add_digital(&ports);
+}
+
 /* --- misc --------------------------------------------------------------- */
 
 static void simDelayMs (uint32_t ms, delay_callback_ptr callback)
@@ -340,6 +409,8 @@ bool driver_init (void)
     // defines DEFAULT_STEP_PULSE_DELAY.
     hal.driver_cap.amass_level = MAX_AMASS_LEVEL;
     hal.driver_cap.step_pulse_delay = On;
+
+    simIoportsInit();
 
     return hal.version == HAL_VERSION;
 }

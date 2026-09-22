@@ -60,6 +60,7 @@ typedef struct st_block {
     bool dynamic_rpm;                  //!< Tracks motions that require dynamic RPM adjustment
     offset_id_t offset_id;
     spindle_ptrs_t *spindle;           //!< Pointer to current spindle for motions that require dynamic RPM adjustment
+    output_command_t *output_commands_head; //!< Head of the output_commands list. Owned by this block and freed by the foreground when the block is recycled - the ISR consumes output_commands as it executes them, so the head is kept here.
 } st_block_t;
 
 typedef struct st_segment {

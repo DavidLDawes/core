@@ -128,6 +128,19 @@ check "description for \$101"               "\$SED=101\n"               "\[SETTI
 check "description for \$102"               "\$SED=102\n"               "\[SETTINGDESCR:102\|"
 check "description for a non-axis setting"  "\$SED=110\n"               "\[SETTINGDESCR:110\|"
 
+# M62-M65 queue "output commands" to be executed with the next move. Before the
+# fix, a soft reset (or a parse error) freed that queue but left the parser's
+# pointer to it dangling. The next M6x then reused the freed block and linked it
+# to itself, and the one after that looped forever in the foreground - taking
+# realtime commands and soft reset with it. Both cases hung (or double-freed)
+# before the fix. The blank line after the ctrl-X (\0030) is sacrificial: a reset
+# that arrives mid-stream discards the line being read when it takes effect.
+echo
+echo "synchronized outputs (M62-M65)"
+check "M62-M65 accepted on aux outputs"         "M62 P0\nM63 P1\nM64 P2\nM65 P3\n"   "ok" "ok" "ok" "ok"
+check "queued output survives a soft reset"     "M62 P0\n\0030\nM62 P0\nM62 P0\n\$G\n"          "\[GC:"
+check "queued output survives a parse error"    "M62 P0\nG1 X1\n\0030\nM62 P0\nM62 P0\n\$G\n"   "error:22" "\[GC:"
+
 echo
 echo "shutdown"
 check "exits cleanly on end of input"       ""                          "GrblHAL"

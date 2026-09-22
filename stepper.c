@@ -100,6 +100,18 @@ static st_block_t st_hold_block;   // Copy of stepper block data for block put o
 //! st_prep_buffer() to reclaim. Written by the ISR only when NULL, cleared by the foreground.
 static char *volatile orphaned_message = NULL;
 
+// Free the output commands owned by a stepper block. Foreground only, and only for a block the
+// ISR is done with - one being recycled by st_prep_buffer(), or any block once st_reset() has
+// stopped the steppers.
+static void st_block_free_output_commands (st_block_t *block)
+{
+    if(block->output_commands_head) {
+        gc_clear_output_commands(block->output_commands_head);
+        block->output_commands_head = NULL;
+    }
+    block->output_commands = NULL;
+}
+
 // Segment preparation data struct. Contains all the necessary information to compute new segments
 // based on the current executing planner block.
 DCRAM static struct {
@@ -749,6 +761,7 @@ FLASHMEM void st_reset (void)
     // Set up stepper block ringbuffer as circular linked list and add id
     uint_fast8_t idx, idx_max = (sizeof(st_block_buffer) / sizeof(st_block_t)) - 1;
     for(idx = 0 ; idx <= idx_max ; idx++) {
+        st_block_free_output_commands(&st_block_buffer[idx]); // Steppers are idle, the ISR no longer uses any block.
         st_block_buffer[idx].next = &st_block_buffer[idx == idx_max ? 0 : idx + 1];
         st_block_buffer[idx].id = idx + 1;
     }
@@ -768,6 +781,7 @@ FLASHMEM void st_reset (void)
     segment_buffer.tail = segment_buffer.head = segment_buffer.segments; // empty = tail
 
     memset(&prep, 0, sizeof(prep));
+    st_hold_block.output_commands = st_hold_block.output_commands_head = NULL; // Alias of a list freed above, never to be restored.
     memset(&st, 0, sizeof(stepper_t));
 
 #if ADAPTIVE_MULTI_AXIS_STEP_SMOOTHING
@@ -972,7 +986,15 @@ void st_prep_buffer (void)
                 st_prep_block->millimeters = pl_block->millimeters;
                 st_prep_block->steps_per_mm = (float)pl_block->step_event_count / pl_block->millimeters;
                 st_prep_block->spindle = pl_block->spindle.hal;
-                st_prep_block->output_commands = pl_block->output_commands;
+                // Take ownership of the output commands, as is done for the message below. The
+                // planner block may be discarded - which frees whatever it still owns - while the
+                // stepper ISR has yet to execute this block, so a copied pointer would leave the
+                // ISR walking freed memory (seen as a HardFault in the ISR on real hardware).
+                // Free the list of the block that last used this entry first: the ring is sized so
+                // that an entry being recycled is no longer in use by the ISR.
+                st_block_free_output_commands(st_prep_block);
+                st_prep_block->output_commands = st_prep_block->output_commands_head = pl_block->output_commands;
+                pl_block->output_commands = NULL;
                 st_prep_block->overrides = pl_block->overrides;
                 st_prep_block->offset_id = pl_block->offset_id;
                 st_prep_block->backlash_motion = pl_block->condition.backlash_motion;
