@@ -693,9 +693,10 @@ if((task = tasks.systick)) do {
 
 `task->next` is re-read *after* `fn()` ran. If the callback deletes itself,
 `task_free()` NULLs `->next` and the remaining systick tasks are silently skipped for that
-tick. Worse: `task_free()` sets `tasks.last_freed`, so any `task_add_*()` call inside that
-same callback hands the identical slot straight back and relinks it — the systick walk then
-continues into the immediate or delayed list and runs those callbacks in the wrong context.
+tick. Worse: `task_free()` pushes the slot onto `tasks.free_list`, so any `task_add_*()`
+call inside that same callback pops the identical slot straight back off the free list and
+relinks it — the systick walk then continues into the immediate or delayed list and runs
+those callbacks in the wrong context.
 
 Fix: cache `next` before invoking `fn`.
 
