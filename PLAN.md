@@ -63,7 +63,7 @@ on a Pi.
 
 ## 1.1 Status
 
-Last updated 2026-09-22.
+Last updated 2026-09-22 (Step 5 landed).
 
 | # | Item | Status |
 |---|---|---|
@@ -80,8 +80,9 @@ Last updated 2026-09-22.
 | 11 | Part 5 Step 3 — interrupt-nesting contract (§4.1) | **done** — both repos |
 | 12 | Part 5 Step 4 — run on hardware (§1.4, §1.9) | **done** |
 | 13 | Critical hardware-only bug found + fixed: M62-M65 use-after-free (§2.1(3)) | **done** |
-| 14 | Part 5 Step 5 — driver defects (Part 3, `ioports_analog.c`) | **not started** |
-| 15 | Remaining code fixes from Parts 2–4 | **not started** |
+| 14 | Part 5 Step 5 — driver defects, all of Part 3 (§3.1(1-5), §3.2(6-7)) | **done** — DavidLDawes/RP2040#4 |
+| 15 | Part 5 Step 6 — performance work (§2.3) | **not started** — next |
+| 16 | Remaining code fixes from Parts 2–4 (§2.1(4-6), §2.2(9-12), §2.4) | **not started** |
 
 The toolchain is installed and a full clean build has been verified on this
 machine, producing `play/RP2040/build/grblHAL.uf2`. `build.sh` now defaults to the
@@ -778,7 +779,7 @@ relative to the driver repo.
 
 ## 3.1 Confirmed defects
 
-### 1. `ioports_analog.c:227` — `pwm_values` is allocated by PWM count but indexed by port ordinal — MEDIUM
+### 1. `ioports_analog.c:227` — `pwm_values` is allocated by PWM count but indexed by port ordinal — MEDIUM — **FIXED**
 
 The array is allocated with one slot per *PWM-capable* output:
 
@@ -805,7 +806,16 @@ The sibling array `pwm_data` gets this right, indexing through the dedicated
 Config-dependent: harmless on a board where every analog output is PWM, which is
 why it has survived.
 
-### 2. `ioports_analog.c:83` — `pwm_data` NULL check missing on the hot path — LOW/MEDIUM
+**Fix (DavidLDawes/RP2040#4):** both functions now index through `pwm_idx` and
+gate on `mode.pwm || mode.servo_pwm`, matching `pwm_data`'s existing pattern.
+Still config-dependent in the opposite direction now: no board defines a
+non-PWM analog output, so there is nothing to reproduce the overflow against.
+Verified on hardware only that the fix doesn't regress the one config that does
+exist - `M67`/`M68` write-then-readback on PICO_CNC's single PWM analog output,
+both correct. This is a defensive fix for a latent bug, not a demonstrated
+crash-to-fixed pair like §2.1(3).
+
+### 2. `ioports_analog.c:83` — `pwm_data` NULL check missing on the hot path — LOW/MEDIUM — **FIXED**
 
 `analog_out()` guards `pwm_values` before writing:
 
@@ -823,7 +833,7 @@ fails, the first `M67` writes through NULL.
 Line 83 also runs for ports where `mode.pwm` is false, using a `pwm_idx` that was
 never assigned for that port.
 
-### 3. `driver.c:2478` — unbounded busy-wait with no escape — LOW (optional feature)
+### 3. `driver.c:2478` — unbounded busy-wait with no escape — LOW (optional feature) — **FIXED**
 
 ```c
 static void _write (void)
@@ -847,30 +857,72 @@ while(tx.busy) {
 }
 ```
 
-### 4. `i2c.c:152` — `// TODO: add timeout handling` — LOW
+### 4. `i2c.c:152` — `// TODO: add timeout handling` — LOW — **FIXED**
 
 The author's own note, and it is a real gap: `i2c_send()` has no timeout, so a
 stuck or absent I²C device blocks. The `stream_blocking_callback()` pump means
 the machine stays responsive, so this is a hang rather than a lockup — but a
 Modbus/expander fault should fail the operation, not wait forever.
 
+**Fix (DavidLDawes/RP2040#4):** every blocking pico-sdk I2C call in the file -
+not just `i2c_send()`, also `i2c_probe()`, `i2c_receive()`, `i2c_get_keycode()`
+and `i2c_transfer()` - swapped for its `*_timeout_us()` equivalent at a shared
+50ms timeout. Auditing every call site for this turned up two more real bugs in
+`i2c_transfer()`, both fixed alongside it and recorded as finding 7 below.
+Compile-verified with `I2C_ENABLE=1`. **Not exercised on hardware** - no I2C
+device is attached to the bench board, and proving the timeout actually fires
+would need a genuinely stuck bus to test against.
+
+### 5. `i2c.c` `i2c_transfer()` — two logic bugs found while fixing finding 4 — MEDIUM — **FIXED, found while fixing #4**
+
+Not in the original review; surfaced while auditing every blocking I2C call
+site for the timeout fix above.
+
+**Unchecked address write before a dependent read.** The read branch fired
+`i2c_read_blocking()` unconditionally after `i2c_write_blocking()` had sent the
+word address, with the write's result never checked at all. A failed or
+timed-out address write leaves the bus in an undefined state for the read that
+follows it in the same transaction. Fixed: the read now only happens if the
+write succeeded.
+
+**`bool`/`int` type confusion always swallowed non-blocking send failures.**
+The non-blocking write branch did:
+
+```c
+ok = i2c_send(i2c->address, txbuf, i2c->count + i2c->word_addr_bytes, false) != PICO_ERROR_GENERIC;
+```
+
+`i2c_send()` returns `bool` (0 or 1). `PICO_ERROR_GENERIC` is `-1`, from a
+completely different family of pico-sdk `int` return codes. Neither `0` nor `1`
+ever equals `-1`, so this comparison was **always true** regardless of whether
+the send actually succeeded - every failure on this path was silently
+swallowed. Fixed: uses `i2c_send()`'s own `bool` result directly.
+
+Same session also fixed the sibling `!= PICO_ERROR_GENERIC` loose-check bug in
+`i2c_probe()` and `i2c_receive()` (would have treated `PICO_ERROR_TIMEOUT`, -2,
+as success - undermining finding 4's fix the moment a timeout actually fired).
+Compile-verified only, same as finding 4.
+
 ## 3.2 Quality and simplicity
 
-### 5. Board selection requires editing a tracked file
+### 6. Board selection requires editing a tracked file — **FIXED** (practice, not a diff)
 
 `CMakeLists.txt:29` — `set(PICO_BOARD pico CACHE STRING "Board type")`, with the
 comment *"Select the correct board in VSCode, the following line will be updated
 accordingly"*. Selecting a board means editing a tracked file, so every working
 tree permanently diverges from upstream and every `git pull` risks a conflict on
-that line. Our own clone carries exactly this diff today.
+that line. Our own clone carried exactly this diff at review time.
 
 It is already a `CACHE` variable, so `-DPICO_BOARD=pico2` on the command line
-works and was verified — CI relies on it. Leaving the tracked default alone and
-passing `-D` (or a CMake preset) removes the divergence entirely. A
-`CMakePresets.json` with one preset per board would be the tidy version and would
-also give the VS Code extension something to select.
+works and was verified — CI relies on it. `build.sh`/`flash.sh` (§1.3, §1.4) now
+pass `-DPICO_BOARD` on every invocation instead of editing this line, so the
+tracked default stays at upstream's `pico` and the working tree no longer
+diverges - confirmed: `CMakeLists.txt:29` is untouched. A `CMakePresets.json`
+with one preset per board remains a nice-to-have for giving the VS Code
+extension something to select, but the actual divergence this finding
+described is resolved.
 
-### 6. `driver.c:3286` — declaration directly after a `case` label
+### 7. `driver.c:3286` — declaration directly after a `case` label — **FIXED**
 
 ```c
 case PinGroup_SpindleIndex:
@@ -1068,14 +1120,26 @@ and passes 3000 moves cleanly on fixed code. This was higher priority than conti
 Step 5 once found, since it is a HIGH-severity crash reachable by ordinary use of M62-M65
 with motion.
 
-### Step 5 — The driver defects (Part 3) — **NEXT**
+### Step 5 — The driver defects (Part 3) — **DONE**
 
-`ioports_analog.c`'s `pwm_values` indexing (§3.1(1)) is the real one; it needs a
-board with a non-PWM analog output to bite, so pair it with a CI matrix entry for
-such a board rather than fixing it blind. The NeoPixel busy-wait and the I²C
-timeout TODO are reliability polish.
+All of Part 3 fixed in DavidLDawes/RP2040#4: the `ioports_analog.c` `pwm_values`
+indexing bug (§3.1(1), §3.1(2)) - a defensive fix, since no board configuration
+exists that makes `n_pwm < n_ports` to reproduce the overflow against - the
+NeoPixel busy-wait (§3.1(3)) and the I2C timeout TODOs (§3.1(4)), plus two
+additional `i2c_transfer()` logic bugs found while auditing every blocking I2C
+call for the timeout fix (§3.1(5)), and the case-label portability fix
+(§3.2(7)). Board selection (§3.2(6)) was already resolved in practice via
+`build.sh`/`flash.sh` passing `-DPICO_BOARD` rather than editing the tracked
+default.
 
-### Step 6 — Performance work (Part 2 §2.3)
+Verified: a full default-configuration build was flashed and the 24-test suite
+passed on hardware; the analog-output and NeoPixel fixes were additionally
+verified against real hardware behaviour (write/readback round-trip, M150
+timing), not just compiled. The I2C fixes and the overflow-shaped
+`ioports_analog.c` bug are compile-verified only - no I2C device is attached to
+the bench, and no board configuration reaches the overflow path.
+
+### Step 6 — Performance work (Part 2 §2.3) — **NEXT**
 
 Deliberately last. Every item — the `steps_per_mm` reciprocal cache, hoisting the
 AMASS shift out of the ISR, the task-pool free list — is a change to hot,
