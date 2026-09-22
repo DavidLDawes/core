@@ -19,6 +19,7 @@ if [ "${1:-}" = "--serial" ]; then
     port="${2:?usage: run_tests.sh --serial <port>}"
     TARGET=("${PYTHON:-python3}" "$(dirname "$0")/serial_bridge.py" "$port")
     LABEL="hardware on $port"
+    IS_SIM=0
     # Real moves take real time, and each case resets and re-homes to the origin.
     TIMEOUT="${TIMEOUT:-90}"
 else
@@ -30,6 +31,7 @@ else
     fi
     TARGET=("$SIM")
     LABEL="$SIM"
+    IS_SIM=1
     TIMEOUT="${TIMEOUT:-20}"
 fi
 
@@ -145,10 +147,14 @@ check "queued output survives a parse error"    "M62 P0\nG1 X1\n\0030\nM62 P0\nM
 # slow, e.g. I2C/Modbus-backed, aux output. M62/M63 run from the stepper ISR when their move
 # starts (PLAN.md 2.2(10)) and must refuse to bind to such a port; M64/M65 run immediately, in
 # the parser's own foreground context, so they're unaffected by the same port's async flag.
-echo
-echo "async-flagged aux port rejected for synced output (2.2(10))"
-check "M62 on an async port is rejected"        "M62 P3\n"   "error:39"
-check "M64 on the same async port still works"  "M64 P3\n"   "^ok"
+# Simulator-only: no port on the bench hardware is flagged this way, so port 3 there is an
+# ordinary GPIO and M62 P3 is expected to succeed - there's nothing async-specific to assert.
+if [ "$IS_SIM" -eq 1 ]; then
+    echo
+    echo "async-flagged aux port rejected for synced output (2.2(10))"
+    check "M62 on an async port is rejected"        "M62 P3\n"   "error:39"
+    check "M64 on the same async port still works"  "M64 P3\n"   "^ok"
+fi
 
 echo
 echo "shutdown"
