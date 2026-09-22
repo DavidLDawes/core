@@ -2563,6 +2563,13 @@ status_code_t gc_execute_block (char *block)
                     RETURN(Status_NegativeValue);
                 if((uint32_t)gc_block.values.p >= ioports_unclaimed(Port_Digital, Port_Output))
                     RETURN(Status_GcodeValueOutOfRange);
+                // M62/M63 execute from the stepper ISR when the move they're queued with starts;
+                // a port whose driver flagged itself async (e.g. I2C/Modbus-backed) may block for
+                // a non-negligible time and must not be bound to a synced output. M64/M65 execute
+                // immediately, in this parser's own foreground context, so they're unaffected.
+                if((port_command == IoMCode_OutputOnSynced || port_command == IoMCode_OutputOffSynced) &&
+                        ioport_out_is_async(Port_Digital, (uint8_t)gc_block.values.p))
+                    RETURN(Status_GcodeValueOutOfRange);
                 gc_block.output_command.is_digital = true;
                 gc_block.output_command.port = (uint8_t)gc_block.values.p;
                 gc_block.output_command.value = port_command == 62 || port_command == 64 ? 1.0f : 0.0f;
@@ -2610,6 +2617,10 @@ status_code_t gc_execute_block (char *block)
                 if(!(gc_block.words.e || gc_block.words.q))
                     RETURN(Status_GcodeValueWordMissing);
                 if((uint32_t)gc_block.values.e >= ioports_unclaimed(Port_Analog, Port_Output))
+                    RETURN(Status_GcodeRPMOutOfRange);
+                // See the M62/M63 comment above - M67 is the analog equivalent of a synced
+                // output; M68 executes immediately and is unaffected.
+                if(port_command == IoMCode_AnalogOutSynced && ioport_out_is_async(Port_Analog, (uint8_t)gc_block.values.e))
                     RETURN(Status_GcodeRPMOutOfRange);
                 gc_block.output_command.is_digital = false;
                 gc_block.output_command.port = (uint8_t)gc_block.values.e;

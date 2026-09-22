@@ -849,7 +849,7 @@ void st_update_plan_block_parameters (bool fast_hold)
 
         if((exec_fast_hold = segment_buffer.head->next == segment_buffer.tail)) {
             segment_buffer.head = segment_buffer.tail->next;
-            if(st.step_count < 3 || st.step_count < (st.exec_segment->n_step >> 3))
+            if(st.step_count < 3 || (st.exec_segment && st.step_count < (st.exec_segment->n_step >> 3)))
                 segment_buffer.head = segment_buffer.head->next;
             while(segment_buffer.head->next != head && segment_buffer.head->ramp_type == Ramp_Decel)
                 segment_buffer.head = segment_buffer.head->next;

@@ -501,7 +501,8 @@ FLASHMEM int grbl_enter (void)
         hal.stream.reset_read_buffer();                 // Clear input stream buffer
         gc_init(settings.flags.keep_offsets_on_reset);  // Set g-code parser to default state
         hal.limits.enable(settings.limits.flags.hard_enabled, (axes_signals_t){0});
-        plan_reset();                                   // Clear block buffer and planner variables
+        if(!plan_reset())                               // Clear block buffer and planner variables
+            system_raise_alarm(Alarm_BufferOverflow);   // Buffer could not be (re)allocated - motion is unsafe
         st_reset();                                     // Clear stepper subsystem variables.
         limits_set_homing_axes();                       // Set axes to be homed from settings.
         system_init_switches();                         // Set switches from inputs.
@@ -586,8 +587,10 @@ static void task_execute (sys_state_t state)
         last_ms = now;
 
         if((task = tasks.systick)) do {
+            core_task_t *next = task->next; // cached before fn() runs: fn() may free or requeue task, invalidating task->next
             task->fn(task->data);
-        } while((task = task->next));
+            task = next;
+        } while(task);
 
         while((task = tasks.delayed) && (int32_t)(task->time - now) <= 0) {
 

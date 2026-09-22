@@ -229,6 +229,7 @@ bool ioport_set_description (io_port_type_t type, io_port_direction_t dir, uint8
 bool ioport_set_function (xbar_t *pin, pin_function_t function, driver_caps_t caps);
 bool ioport_analog_out (uint8_t port, float value);
 bool ioport_digital_out (uint8_t port, uint32_t value);
+bool ioport_out_is_async (io_port_type_t type, uint8_t port); //!< true if this output port may block or take non-negligible time - unsafe for motion-synchronized (M62/M63/M67) output
 int32_t ioport_wait_on_input (io_port_type_t type, uint8_t port, wait_mode_t wait_mode, float timeout);
 bool ioport_analog_out_config (uint8_t port, pwm_config_t *config);
 bool ioport_digital_pwm_config (uint8_t port, pwm_config_t *config);

@@ -633,6 +633,13 @@ bool ioport_digital_out (uint8_t port, uint32_t value)
     return !!hal.port.digital_out;
 }
 
+bool ioport_out_is_async (io_port_type_t type, uint8_t port)
+{
+    xbar_t *info = ioport_get_info(type, Port_Output, port);
+
+    return info && info->cap.async;
+}
+
 int32_t ioport_wait_on_input (io_port_type_t type, uint8_t port, wait_mode_t wait_mode, float timeout)
 {
     return hal.port.wait_on_input ? hal.port.wait_on_input(type, port, wait_mode, timeout) : -1;

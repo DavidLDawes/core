@@ -63,7 +63,7 @@ on a Pi.
 
 ## 1.1 Status
 
-Last updated 2026-09-22 (Step 7 landed).
+Last updated 2026-09-22 (item 17 landed).
 
 | # | Item | Status |
 |---|---|---|
@@ -83,7 +83,8 @@ Last updated 2026-09-22 (Step 7 landed).
 | 14 | Part 5 Step 5 — driver defects, all of Part 3 (§3.1(1-5), §3.2(6-7)) | **done** — DavidLDawes/RP2040#4 |
 | 15 | Part 5 Step 6 — performance work, all four §2.3 items | **done** |
 | 16 | Part 5 Step 7 — HIGH core bug fixed: late-registered settings-changed hooks (§2.1(7)) | **done** — confirmed on hardware via SWD breakpoint |
-| 17 | Remaining code fixes from Parts 2–4 (§2.1(4-6), §2.2(10-12), §2.4) | **not started** |
+| 17 | Remaining code fixes from Parts 2–4 (§2.1(4-6), §2.2(10-12), §2.4) | **done** — 5 fixed, 1 investigated and closed as not-a-bug; fuzzing/Doxyfile/kinematics-CI in §2.4 deliberately left as future work |
+| 18 | Hardware smoke test of item 17's fixes | **done** — built, flashed, full regression suite green (sim 26/26, hardware 24/24 + 2 sim-only) |
 
 The toolchain is installed and a full clean build has been verified on this
 machine, producing `play/RP2040/build/grblHAL.uf2`. `build.sh` now defaults to the
@@ -676,14 +677,31 @@ fixed code does not, across a full run. Also confirmed the output actually still
 correct polarity, and only on the move that carries it, not before or after - so the fix
 doesn't just paper over the crash by dropping the feature.
 
-### 4. `grbllib.c:489` — `plan_reset()` return value ignored — MEDIUM
+### 4. `grbllib.c:489` — `plan_reset()` return value ignored — MEDIUM — **FIXED**
 
 `plan_reset()` returns `false` and leaves `block_buffer.blocks == NULL` when the planner
 buffer can't be allocated (`planner.c:230-246`), returning *before* `head`/`tail` are
 initialised. The caller ignores this. `plan_buffer_line()` then dereferences a NULL
 `block_buffer.head` on the first motion.
 
-### 5. `grbllib.c:577` — use-after-free in the systick task walk — MEDIUM
+**Fixed.** `grbl_enter()`'s re-init loop now checks the return value and calls
+`system_raise_alarm(Alarm_BufferOverflow)` when it's false, putting the system into
+`STATE_ALARM` with `sys.blocking_event` set (requires a real reset/power cycle to clear,
+since retrying won't succeed - the allocation already failed at the smallest fallback size)
+instead of silently continuing into the NULL-deref hazard. `Alarm_BufferOverflow` (defined,
+value 22, but previously never raised anywhere in core) was reused for this rather than
+adding a new alarm code, and added to `alarm_is_critical()`'s list so `sys.blocking_event`
+is actually set; its description text was extended to also cover an allocation failure, not
+just an overflow.
+
+**Not independently verified with its own test** - this requires genuinely exhausting
+allocatable memory at boot, not reproducible from the host simulator's or the bench
+hardware's external protocol. Verified instead by: code inspection of the fixed call site,
+the regression suite (unaffected, since this path is never exercised by it), and a full
+build + flash + hardware smoke test (§1.1 item 18) confirming the change introduces no
+regression to normal boot/motion.
+
+### 5. `grbllib.c:577` — use-after-free in the systick task walk — MEDIUM — **FIXED**
 
 ```c
 if((task = tasks.systick)) do {
@@ -698,13 +716,31 @@ call inside that same callback pops the identical slot straight back off the fre
 relinks it — the systick walk then continues into the immediate or delayed list and runs
 those callbacks in the wrong context.
 
-Fix: cache `next` before invoking `fn`.
+**Fixed** exactly as prescribed: `next` is cached into a local before `fn()` runs, so the
+walk's traversal no longer depends on `task->next` still being meaningful afterward.
 
-### 6. `protocol.c:76` — unbounded `strcpy` on a public API — MEDIUM
+**Not independently verified with its own test** - reproducing the failure needs a systick
+task that deletes itself and re-registers a new one from inside its own callback, which
+nothing in this tree currently does deliberately. Verified instead by: the fix is a small,
+mechanical, well-understood pattern (cache-before-mutate); the regression suite (unaffected);
+and a hardware smoke test - `task_execute()`'s systick path runs continuously in normal
+operation (it's what drives `auto_realtime_report`), so any gross breakage would have shown
+up immediately as a hang or missing status reports, and didn't.
+
+### 6. `protocol.c:76` — unbounded `strcpy` on a public API — MEDIUM — **FIXED**
 
 `protocol_enqueue_gcode()` is exposed to plugins as `grbl.enqueue_gcode` and copies
 caller-supplied text into `xcommand[LINE_BUFFER_SIZE]` with no length check. `strlcpy` is
 already used elsewhere in the tree.
+
+**Fixed.** Added `strlen(gcode) < sizeof(xcommand)` to the existing `ok` gate - a too-long
+command is rejected outright (returns `false`, `xcommand` untouched) rather than silently
+truncated into a different, shorter, still-valid-looking command. Switched the copy itself
+to `strlcpy` for defense in depth once that guard is in place. Verified compiling clean and
+against the regression suite (unaffected - no existing test sends an oversized command
+through this path); not independently exercised with a new test, since `protocol_enqueue_gcode`
+has no G-code/`$`-command surface to drive it from the sim's or hardware's external ASCII
+protocol - it's a plugin-facing C API called directly by driver/plugin code.
 
 ### 7. `settings.c` — a late-registered `grbl.on_settings_changed` hook is silently never called for a single-setting write — HIGH — **FIXED (Step 7)**
 
@@ -797,7 +833,7 @@ outer critical section too. Functions marked `ISR_CODE` and documented ISR-calla
 calling them from an ISR clears PRIMASK *inside* that ISR. The contract isn't stated
 anywhere in `hal.h`.
 
-### 10. Aux I/O driven from the stepper ISR — MEDIUM
+### 10. Aux I/O driven from the stepper ISR — MEDIUM — **FIXED, scoped to what core controls**
 
 `ioport_digital_out()` / `ioport_analog_out()` are called from the stepper ISR
 (`stepper.c:513-519`) for M62–M65 motion-synchronised output. An aux port backed by an I²C
@@ -806,21 +842,80 @@ or Modbus expander blocks the ISR for milliseconds. Partly known — `on_port_ou
 
 Same neighbourhood as §2.1(3)'s use-after-free - both are about the output-command list
 that this same ISR code walks. §2.1(3) fixes the list's memory safety; this finding about
-blocking on a slow port is still open.
+blocking on a slow port is a separate, until-now-open concern.
 
-### 11. `stepper.c:815` — unguarded `exec_segment` deref — LOW / uncertain
+**Fixed the part core can actually fix.** Core has no way to know from here which of a
+driver's or plugin's aux ports are I²C/Modbus-backed and slow - that lives entirely in
+driver/plugin code (`i2c_leds.c`, `mcp23017.c`, `pca9654e.c`, `hc595.c`, etc., none of which
+are in this repo). What core *can* do is give those port implementations a way to say so, and
+refuse to bind a marked port to motion-synchronised output:
+
+* `pin_cap_t` (`crossbar.h`) already had an unused, undocumented `async :1` bit. Documented
+  it: "output may block or take non-negligible time - unsafe to call from interrupt context."
+* Added `ioport_out_is_async()` (`ioports.c`/`.h`), a thin wrapper reading that bit off
+  `ioport_get_info()`.
+* `gcode.c`'s M62/M63 (digital) and M67 (analog) validation - the only paths that queue a
+  motion-synchronised output for the stepper ISR to execute - now reject a port with that bit
+  set (`Status_GcodeValueOutOfRange` / `Status_GcodeRPMOutOfRange`, reusing the existing
+  out-of-range codes for this block rather than adding new ones). M64/M65/M68 (the immediate
+  variants, which execute in the parser's own foreground context, never the ISR) are
+  unaffected.
+
+**Honestly scoped**: no port shipped in this repo or the RP2040 driver currently sets
+`cap.async`, so this is currently inert in practice - it establishes the mechanism a slow
+port implementation needs to opt into, not a fix that changes today's behaviour on any real
+board. Adopting it in the actual slow-port plugins is out of scope here (separate repo).
+
+**Verified**: a new host-simulator regression test (`test/sim_driver.c` flags aux output
+port 3 async; `test/run_tests.sh`, sim-only) confirms `M62 P3` is rejected with `error:39`
+while `M64 P3` still succeeds. Confirmed on the bench hardware that this introduces no
+regression to the real (non-async) aux ports - the existing M62-M65 hardware tests still pass
+unchanged, and (correctly) a real board's port 3 is not flagged, so `M62 P3` there still
+succeeds - there's no async-flagged port on this bench to reject.
+
+### 11. `stepper.c:815` — unguarded `exec_segment` deref — LOW / uncertain — **FIXED**
 
 The experimental fast-hold path dereferences `st.exec_segment->n_step` with no NULL check,
 while every other use of `exec_segment` in the file is NULL-guarded. Marked experimental.
 
-### 12. `planner.c:401` — hidden state across reset — LOW
+**Fixed** with a NULL guard matching the rest of the file's pattern:
+`st.step_count < 3 || (st.exec_segment && st.step_count < (st.exec_segment->n_step >> 3))`.
+When `exec_segment` is NULL there's no "current segment's step count" to compare against, so
+the guard falls back to just the `step_count < 3` half of the original condition rather than
+guessing new semantics. Compiles clean; not independently exercised with a new test - this is
+explicitly experimental, ISR-adjacent code (`st_update_plan_block_parameters(fast_hold)`,
+called from `planner_recalculate()` under `hal.irq_disable()`) reached only via a feed-hold
+recalculation timing window that isn't reliably reproducible from either harness. Verified by
+code inspection (the guard matches every other `exec_segment` use in this file) and the
+regression suite / hardware smoke test showing no regression to normal feed-hold behaviour.
+
+### 12. `planner.c:401` — hidden state across reset — LOW — **investigated, not a bug**
 
 `static axes_signals_t direction` persists across soft reset and is only updated for axes
 with a non-zero step delta. Likely deliberate, but `plan_reset()` doesn't clear it.
 
-### 13. No CI, no tests, no host-buildable target
+**Investigated, closing without a code change.** Traced every consumer of the bit this
+finding worried about: `stepper.c`'s Bresenham loop only reads `st.dir_out`'s bit for an axis,
+and only updates `sys.position` for that axis, inside the `if(st.counter.x > st.step_event_count)`
+branch - which structurally cannot execute for an axis with `steps.value[idx] == 0`, since
+`st.counter.x` is only ever incremented by `st.steps.x`. A stale `direction` bit for a
+non-stepping axis is therefore never read into position tracking, and never gates an actual
+step pulse - it's provably inert, both within a session and across a reset. This also matches
+real hardware behaviour: an axis that isn't stepping shouldn't have its DIR pin's meaning
+change either. Forcibly clearing it in `plan_reset()` would be a change with no benefit and a
+small risk of its own (a spurious DIR transition on that axis's first move after reset, itself
+harmless but unnecessary). No code change made.
 
-For a codebase that moves a machine, this is the largest structural gap. See §2.3.
+### 13. No CI, no tests, no host-buildable target — **RESOLVED**
+
+For a codebase that moves a machine, this was the largest structural gap when this review
+was written.
+
+**Resolved since**: `test/sim_driver.c` (a minimal HAL letting core run as a PC process) and
+`test/run_tests.sh` (a growing regression suite, now 24 cases plus 2 simulator-only ones) were
+added as part of Part 5 Step 2, and GitHub Actions CI (§1.7) builds both the simulator and a
+6-way driver matrix on every push and PR. This is also §2.4's first extension-opportunity
+bullet, delivered rather than left as a suggestion - see the note there.
 
 ## 2.3 Optimisation opportunities
 
@@ -917,16 +1012,23 @@ byte-identical output before and after the change, in the simulator.
 
 ## 2.4 Extension opportunities
 
-* **A POSIX host driver.** `planner.c:285` already references "the grblHAL simulator". A
-  stub implementing the `hal` contract would make the parser, planner and NGC layers
-  unit-testable, give CI something to run, and remove the §1.10 constraint that nothing can
-  be verified without hardware. Highest-leverage item on this list.
+* **A POSIX host driver — DONE.** `planner.c:285` already referenced "the grblHAL simulator"
+  when this was written. `test/sim_driver.c` (a `hal` contract stub) and `test/run_tests.sh`
+  (the regression suite it runs) delivered exactly this - see §2.2(13) and §1.8. This was the
+  highest-leverage item on the list and was worth doing rather than leaving as a suggestion.
 * **Fuzz `gcode.c` and `ngc_expr.c`.** Both are effectively pure functions of an untrusted
-  string and are the natural first target once a host build exists.
+  string and are the natural first target now that a host build exists. Not attempted in this
+  pass - setting up a real fuzzing harness (corpus, libFuzzer/AFL integration, a CI job to run
+  it) is substantial, separately-scoped work, not a fix to fold into a findings sweep.
 * **Add a `Doxyfile`.** There are 290 `__DOXYGEN__` guards across the headers and no config
-  to consume them.
+  to consume them. Not attempted in this pass, for the same reason.
 * **A build matrix** over `N_AXIS` × `COMPATIBILITY_LEVEL` × kinematics, which is where
-  option-combination breakage actually lives.
+  option-combination breakage actually lives. The existing CI matrix (§1.7) covers `N_AXIS`
+  (4/8) and `COMPATIBILITY_LEVEL` (1/2) already; it does not yet build any of the
+  `KINEMATICS_API` variants (`COREXY`, `WALL_PLOTTER`, `DELTA_ROBOT`, `POLAR_ROBOT`,
+  `RTCP_AC`, `ASYMMETRIC_GANGING`, `ASYMMETRIC_AUTO_SQUARE`). Not attempted in this pass -
+  worth its own step, since it means auditing what board config each kinematics variant
+  actually needs to compile standalone, not just adding a matrix row.
 
 ---
 
