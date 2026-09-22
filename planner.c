@@ -193,8 +193,10 @@ inline static void plan_cleanup (plan_block_t *block)
         block->message = NULL;
     }
 
-    if(block->output_commands)
+    if(block->output_commands) {
         gc_clear_output_commands(block->output_commands);
+        block->output_commands = NULL;
+    }
 }
 
 inline static void plan_reset_buffer (block_buffer_t *buffer, bool init)

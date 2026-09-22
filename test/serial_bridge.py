@@ -36,8 +36,9 @@ process. A board does not, so before each case this silently:
      a soft reset, and cases such as the arc test depend on where they start;
   4. soft-resets again, so parser and modal state are exactly power-on default.
 
-Only the banner from the final reset and the response to the case itself are
-written out. After the case it waits for any motion to finish, so the next
+The case is then streamed the way a real sender does it - see stream() - and
+only the banner from the final reset plus the response to the case are written
+out. After the case it waits for any motion to finish, so the next
 case's reset never lands mid-move (which would raise an alarm).
 
 Needs pyserial. Set BRIDGE_VERBOSE=1 to log setup steps to stderr - note that
@@ -57,6 +58,9 @@ CAN = b"\x18"    # ctrl-X, soft reset
 BANNER = re.compile(rb"GrblHAL [^\r\n]*for help\]")
 STATUS = re.compile(rb"<([A-Za-z]+)[|:>]")
 REPLY = re.compile(rb"^(ok|error:\d+)", re.M)
+
+# Bytes the controller treats as realtime commands (plus 0x80-0xBF).
+REALTIME = {CAN, b"?", b"!", b"~"}
 
 # States in which the machine is still moving and must not be reset.
 MOVING = {"Run", "Jog", "Home"}
@@ -134,6 +138,50 @@ def wait_idle(ser, limit):
     raise HardwareError("machine still moving after %ss" % limit)
 
 
+def tokens(case):
+    """Split a case into realtime bytes and newline-terminated lines.
+
+    A realtime byte is only recognised at the start of a line, which is all the
+    test cases need and avoids mistaking one inside a comment for a command.
+    """
+    line = b""
+    for i in range(len(case)):
+        c = case[i:i + 1]
+        if not line and (c in REALTIME or 0x80 <= c[0] <= 0xBF):
+            yield "rt", c
+        else:
+            line += c
+            if c == b"\n":
+                yield "line", line
+                line = b""
+    if line:
+        yield "line", line
+
+
+def stream(ser, case):
+    """Send a case the way a real sender does, and return everything received.
+
+    Writing the whole case at once is not equivalent: the board handles realtime
+    bytes in its receive interrupt the moment they arrive, and a soft reset then
+    flushes the receive buffer - so lines sent before a ctrl-X but not yet parsed
+    are silently dropped, and those after it arrive mangled. That is correct
+    firmware behaviour, and exactly why senders use the send-response protocol:
+    wait for each line's ok/error, and for the banner after a reset.
+    """
+    out = b""
+    for kind, data in tokens(case):
+        ser.write(data)
+        if kind == "line":
+            buf, _ = read_until(ser, REPLY, 30.0)
+            out += buf
+        elif data == CAN:
+            buf, _ = read_until(ser, BANNER, 5.0)
+            out += buf
+        # other realtime bytes (e.g. '?') are answered asynchronously; their
+        # output is picked up by the next read or the final read_quiet()
+    return out + read_quiet(ser, 0.5, 5.0)
+
+
 def main():
     if len(sys.argv) != 2:
         sys.stderr.write("usage: serial_bridge.py <port> < case-input\n")
@@ -155,10 +203,7 @@ def main():
 
             preamble = reset(ser)
 
-            output = b""
-            if case:
-                ser.write(case)
-                output = read_quiet(ser, 0.5, 30.0)
+            output = stream(ser, case) if case else b""
 
             log("waiting for motion to finish")
             wait_idle(ser, 120)

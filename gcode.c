@@ -725,8 +725,16 @@ static status_code_t gc_at_exit (status_code_t status)
         pending_tool = NULL;
         gc_state.g43_pending = (tool_id_t)-1;
 
-        // Clear any pending output commands
+        // Clear any pending output commands.
+        // NOTE: output_commands must be reset as well - gc_clear_output_commands() frees the
+        // list but cannot clear the caller's pointer. Left dangling, the next M62-M67 walks
+        // freed memory, and once malloc() hands the same block back add_output_command()
+        // links the new node to itself: the following M62-M67 then loops forever in the
+        // foreground, taking realtime command handling and soft reset down with it.
+        // gc_init() calls this on every soft reset, so "M62 P0, reset, M62 P0, M62 P0"
+        // was enough to hang the controller.
         gc_clear_output_commands(output_commands);
+        output_commands = NULL;
 
         // Clear any registered M98 macros
         macros_clear();

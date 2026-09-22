@@ -63,7 +63,7 @@ on a Pi.
 
 ## 1.1 Status
 
-Last updated 2026-09-21.
+Last updated 2026-09-22.
 
 | # | Item | Status |
 |---|---|---|
@@ -79,7 +79,9 @@ Last updated 2026-09-21.
 | 10 | Part 5 Step 2 — host simulator and regression suite (§1.8) | **done** |
 | 11 | Part 5 Step 3 — interrupt-nesting contract (§4.1) | **done** — both repos |
 | 12 | Part 5 Step 4 — run on hardware (§1.4, §1.9) | **done** |
-| 13 | Remaining code fixes from Parts 2–4 | **not started** |
+| 13 | Critical hardware-only bug found + fixed: M62-M65 use-after-free (§2.1(3)) | **done** |
+| 14 | Part 5 Step 5 — driver defects (Part 3, `ioports_analog.c`) | **not started** |
+| 15 | Remaining code fixes from Parts 2–4 | **not started** |
 
 The toolchain is installed and a full clean build has been verified on this
 machine, producing `play/RP2040/build/grblHAL.uf2`. `build.sh` now defaults to the
@@ -586,8 +588,11 @@ Findings marked **FIXED** have been addressed on this fork; the rest are still o
 Line numbers are as of the original review, so they may have shifted slightly in fixed
 files.
 
-**Findings are from reading, not from running.** Fixes are verified as *compiling*
-across the six CI configurations — nothing has been executed on hardware.
+**Findings 1-9 below are from reading, not from running** - the original review pass.
+All fixes are verified as *compiling* across the six CI configurations. Findings 1 and 2
+are additionally verified with the host simulator (§1.8); finding 3 was not found by
+reading at all - it only surfaces under real hardware timing - and is verified on real
+hardware (§1.4, §1.9) with a dedicated regression test.
 
 ## 2.1 Confirmed defects
 
@@ -621,14 +626,59 @@ With newlib-nano and a no-op `__malloc_lock` — the common bare-metal configura
 landing mid-`malloc()` in the foreground corrupts the heap. Leaking the message would be
 strictly safer than freeing it here.
 
-### 3. `grbllib.c:489` — `plan_reset()` return value ignored — MEDIUM
+### 3. `gcode.c` / `planner.c` / `stepper.c` — use-after-free of M62-M65 output command lists — HIGH — **FIXED, found on hardware**
+
+Discovered while bringing up hardware for Part 5 Step 5, not by static review — the
+simulator's simplified stepper model can't reproduce it, since it has no real ISR/foreground
+concurrency. On real RP2040 hardware it reliably HardFaults inside the stepper ISR within a
+few thousand moves that each carry a synchronized output command (M62/M63/M64/M65).
+
+The output command list for a queued M62-style command is allocated by the parser
+(`gcode.c`), handed to the planner block, then copied - as a bare pointer - into the
+stepper block by `st_prep_buffer()` (`stepper.c:975`, before the fix). The **planner
+block** kept ownership: `plan_discard_current_block()` -> `plan_cleanup()` frees the list
+as soon as the block has been prepped into a stepper block, which can happen *before* the
+stepper ISR has executed that stepper block. The ISR then walks a freed linked list
+(`stepper.c:516-522`) - a use-after-free from interrupt context, which on RP2040 shows up
+as a HardFault with a corrupted `next` pointer.
+
+A second, milder instance: `gcode.c:729`'s `gc_at_exit()` cleared the global
+`output_commands` list on a soft reset or parse error, but never reset the module-level
+`output_commands` pointer itself (fixed separately, `gcode.c` + `planner.c` - see the
+regression tests `queued output survives a soft reset` / `...a parse error`). That variant
+is exercised by the simulator and was the first thing caught; the ISR-facing variant above
+needed real hardware timing to surface.
+
+**Fix** - give the *stepper block* real ownership instead of copying a bare pointer:
+
+* `stepper.h`: `st_block_t` gains `output_commands_head`, the pointer the block actually
+  owns and must free. `output_commands` is still what the ISR walks as it executes items.
+* `stepper.c`: `st_prep_buffer()` now frees whatever list is still attached to the ring
+  buffer entry being recycled *before* overwriting it (an entry being reused is guaranteed
+  no longer in use by the ISR - that's what makes the ring buffer safe), takes ownership of
+  the planner block's list, and clears the planner block's pointer so
+  `plan_discard_current_block()` has nothing left to double-free.
+* `st_reset()` frees every block's list on reset (steppers are idle, so nothing is
+  ISR-owned at that point) and clears the aliased `st_hold_block` copy so it's never
+  "restored" after being freed.
+
+**Verified on hardware**, not just compiled: `test/hw_output_commands.py` runs 3000 moves
+each carrying an M62, before the fix HardFaulting the board partway through and after the
+fix completing cleanly with the heap unchanged (214K free, before == after). Confirmed the
+*unfixed* code reliably reproduces the fault (halted the core over SWD mid-fault: PC in
+`stepper_driver_interrupt_handler`, walking a linked list pointing into freed heap) and the
+fixed code does not, across a full run. Also confirmed the output actually still executes -
+correct polarity, and only on the move that carries it, not before or after - so the fix
+doesn't just paper over the crash by dropping the feature.
+
+### 4. `grbllib.c:489` — `plan_reset()` return value ignored — MEDIUM
 
 `plan_reset()` returns `false` and leaves `block_buffer.blocks == NULL` when the planner
 buffer can't be allocated (`planner.c:230-246`), returning *before* `head`/`tail` are
 initialised. The caller ignores this. `plan_buffer_line()` then dereferences a NULL
 `block_buffer.head` on the first motion.
 
-### 4. `grbllib.c:577` — use-after-free in the systick task walk — MEDIUM
+### 5. `grbllib.c:577` — use-after-free in the systick task walk — MEDIUM
 
 ```c
 if((task = tasks.systick)) do {
@@ -644,7 +694,7 @@ continues into the immediate or delayed list and runs those callbacks in the wro
 
 Fix: cache `next` before invoking `fn`.
 
-### 5. `protocol.c:76` — unbounded `strcpy` on a public API — MEDIUM
+### 6. `protocol.c:76` — unbounded `strcpy` on a public API — MEDIUM
 
 `protocol_enqueue_gcode()` is exposed to plugins as `grbl.enqueue_gcode` and copies
 caller-supplied text into `xcommand[LINE_BUFFER_SIZE]` with no length check. `strlcpy` is
@@ -652,12 +702,12 @@ already used elsewhere in the tree.
 
 ## 2.2 Design and documentation
 
-### 6. `hal.h:638-641` — Doxygen comments swapped — LOW but public — **FIXED**
+### 7. `hal.h:638-641` — Doxygen comments swapped — LOW but public — **FIXED**
 
 `irq_enable` is documented as "Optional handler to **disable** global interrupts" and
 `irq_disable` as "...**enable**...". This is driver-author-facing generated API docs.
 
-### 7. `hal.irq_disable()` / `irq_enable()` don't save and restore the mask — MEDIUM — **FIXED**
+### 8. `hal.irq_disable()` / `irq_enable()` don't save and restore the mask — MEDIUM — **FIXED**
 
 They are unconditional, so they don't nest: an inner pair re-enables interrupts for the
 outer critical section too. Functions marked `ISR_CODE` and documented ISR-callable
@@ -665,24 +715,28 @@ outer critical section too. Functions marked `ISR_CODE` and documented ISR-calla
 calling them from an ISR clears PRIMASK *inside* that ISR. The contract isn't stated
 anywhere in `hal.h`.
 
-### 8. Aux I/O driven from the stepper ISR — MEDIUM
+### 9. Aux I/O driven from the stepper ISR — MEDIUM
 
 `ioport_digital_out()` / `ioport_analog_out()` are called from the stepper ISR
 (`stepper.c:513-519`) for M62–M65 motion-synchronised output. An aux port backed by an I²C
 or Modbus expander blocks the ISR for milliseconds. Partly known — `on_port_out` says
 "might be called from interrupt context" — but nothing prevents a slow port being bound.
 
-### 9. `stepper.c:815` — unguarded `exec_segment` deref — LOW / uncertain
+Same neighbourhood as §2.1(3)'s use-after-free - both are about the output-command list
+that this same ISR code walks. §2.1(3) fixes the list's memory safety; this finding about
+blocking on a slow port is still open.
+
+### 10. `stepper.c:815` — unguarded `exec_segment` deref — LOW / uncertain
 
 The experimental fast-hold path dereferences `st.exec_segment->n_step` with no NULL check,
 while every other use of `exec_segment` in the file is NULL-guarded. Marked experimental.
 
-### 10. `planner.c:401` — hidden state across reset — LOW
+### 11. `planner.c:401` — hidden state across reset — LOW
 
 `static axes_signals_t direction` persists across soft reset and is only updated for axes
 with a non-zero step delta. Likely deliberate, but `plan_reset()` doesn't clear it.
 
-### 11. No CI, no tests, no host-buildable target
+### 12. No CI, no tests, no host-buildable target
 
 For a codebase that moves a machine, this is the largest structural gap. See §2.3.
 
@@ -848,7 +902,7 @@ This is the part that neither repo's own review surfaces.
 
 ## 4.1 `hal.irq_disable()` / `irq_enable()` do not nest, and ISR-callable core code calls them — HIGH — **FIXED**
 
-Part 2 §2.2(7) flagged that the HAL contract has no save/restore. The driver
+Part 2 §2.2(8) flagged that the HAL contract has no save/restore. The driver
 confirms it concretely:
 
 ```c
@@ -897,7 +951,7 @@ and correspondingly for `hal.irq_enable`/`hal.irq_disable`, which need a
 save/restore pair in the HAL contract rather than two independent void functions.
 That is an API change in core's `hal.h`, so it touches both repos — which is
 exactly why it belongs in Part 4. At minimum, core's `hal.h` should *document*
-that these do not nest (it currently documents them backwards; Part 2 §2.2(6)).
+that these do not nest (it currently documents them backwards; Part 2 §2.2(7)).
 
 ## 4.2 Pin activity can drive the stepper ISR into calling `free()` — HIGH
 
@@ -989,7 +1043,7 @@ later.
 Needs both repos, which is why it comes after the harness exists.
 
 1. In core, change `hal.h` so the contract is a save/restore pair rather than two
-   independent voids, and fix the swapped Doxygen comments (Part 2 §2.2(6)).
+   independent voids, and fix the swapped Doxygen comments (Part 2 §2.2(7)).
 2. In the driver, implement it with `__get_PRIMASK()` / `__set_PRIMASK()` and fix
    the three `*Atomic` helpers the same way.
 3. Note it in `changelog.md` — it is an ABI change for every other driver.
@@ -1002,6 +1056,17 @@ argument for Step 4.
 Done on an original Pico (RP2040) rather than a Pico 2. 21/21 on the board and a
 realtime stress test during motion pass. The board has nothing attached, so this
 exercises the firmware, not a machine.
+
+### Step 4.5 — Unplanned: a critical hardware-only bug in core, found while starting Step 5 — **DONE**
+
+Bringing up M62/M63 output-command testing on hardware (in service of Step 5's
+`ioports_analog.c` work) surfaced a HardFault-on-hardware use-after-free in core's
+output-command list ownership (§2.1(3)) - a bug the simulator cannot reproduce, since it
+has no real ISR/foreground concurrency. Fixed and verified with a dedicated hardware
+regression test (`test/hw_output_commands.py`) that reproduces the fault on unfixed code
+and passes 3000 moves cleanly on fixed code. This was higher priority than continuing
+Step 5 once found, since it is a HIGH-severity crash reachable by ordinary use of M62-M65
+with motion.
 
 ### Step 5 — The driver defects (Part 3) — **NEXT**
 
