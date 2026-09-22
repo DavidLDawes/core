@@ -66,6 +66,7 @@ static void protocol_exec_rt_suspend (sys_state_t state);
 FLASHMEM bool protocol_enqueue_gcode (char *gcode)
 {
     bool ok = *xcommand == '\0' &&
+               strlen(gcode) < sizeof(xcommand) &&
                (state_get() == STATE_IDLE || (state_get() & (STATE_ALARM|STATE_JOG|STATE_TOOL_CHANGE))) &&
                  !((sys.rt_exec_state & (EXEC_MOTION_CANCEL|EXEC_MOTION_CANCEL_FAST)));
 
@@ -73,7 +74,7 @@ FLASHMEM bool protocol_enqueue_gcode (char *gcode)
         ok = gc_state.modal.program_flow != ProgramFlow_Running || strncmp((char *)gcode, "$J=", 3);
 
     if(ok)
-        strcpy(xcommand, gcode);
+        strlcpy(xcommand, gcode, sizeof(xcommand));
 
     return ok;
 }

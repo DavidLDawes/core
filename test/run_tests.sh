@@ -141,6 +141,15 @@ check "M62-M65 accepted on aux outputs"         "M62 P0\nM63 P1\nM64 P2\nM65 P3\
 check "queued output survives a soft reset"     "M62 P0\n\0030\nM62 P0\nM62 P0\n\$G\n"          "\[GC:"
 check "queued output survives a parse error"    "M62 P0\nG1 X1\n\0030\nM62 P0\nM62 P0\n\$G\n"   "error:22" "\[GC:"
 
+# Aux port 3 in the simulator is flagged async (see sim_driver.c getPinInfo()) to stand in for a
+# slow, e.g. I2C/Modbus-backed, aux output. M62/M63 run from the stepper ISR when their move
+# starts (PLAN.md 2.2(10)) and must refuse to bind to such a port; M64/M65 run immediately, in
+# the parser's own foreground context, so they're unaffected by the same port's async flag.
+echo
+echo "async-flagged aux port rejected for synced output (2.2(10))"
+check "M62 on an async port is rejected"        "M62 P3\n"   "error:39"
+check "M64 on the same async port still works"  "M64 P3\n"   "^ok"
+
 echo
 echo "shutdown"
 check "exits cleanly on end of input"       ""                          "GrblHAL"

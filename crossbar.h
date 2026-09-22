@@ -767,7 +767,7 @@ typedef union {
                  claimable  :1,
                  debounce   :1,
                  external   :1,
-                 async      :1,
+                 async      :1, //!< output may block or take non-negligible time (e.g. I2C/Modbus-backed) - unsafe to call from interrupt context, so core refuses to bind it to a motion-synchronized (M62/M63/M67) output
                  resolution :4, //!< resolution_t - ADC/DAC resolution
                  unused     :10;
     };

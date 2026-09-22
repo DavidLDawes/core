@@ -76,7 +76,8 @@ static inline bool alarm_is_critical (alarm_code_t alarm)
 			alarm == Alarm_SoftLimit ||
 			 alarm == Alarm_EStop ||
 			  alarm == Alarm_MotorFault ||
-			   alarm == Alarm_ExpanderException;
+			   alarm == Alarm_ExpanderException ||
+			    alarm == Alarm_BufferOverflow;
 }
 
 #endif

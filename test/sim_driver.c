@@ -271,6 +271,8 @@ static xbar_t *getPinInfo (io_port_direction_t dir, uint8_t port)
     pin.cap.mask = pin.mode.mask;
     pin.cap.invert = On;
     pin.cap.claimable = On;
+    if(port == 3) // exercises the M62/M63/M67 rejection of async-flagged ports (PLAN.md 2.2(10))
+        pin.cap.async = On;
     pin.function = (pin_function_t)(Output_Aux0 + port);
     pin.group = PinGroup_AuxOutput;
     pin.pin = port;
