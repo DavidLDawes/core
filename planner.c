@@ -47,6 +47,45 @@ typedef struct {
 static planner_t pl;
 static block_buffer_t block_buffer;
 
+// 1.0f / settings.axis[idx].steps_per_mm, cached instead of divided out fresh on every call -
+// plan_buffer_line() alone does this once per axis on every queued motion block, the hot path
+// for G-code streaming throughput, and plan_get_position() once per axis on every position
+// query (kinematics builds only).
+//
+// Deliberately NOT invalidated via grbl.on_settings_changed. That chain turned out not to be a
+// safe way to react to a single setting write for a core, non-plugin setting like this one:
+// settings_store_setting() (settings.c) dispatches through set->on_changed, a per settings-group
+// snapshot of grbl.on_settings_changed taken once, unconditionally, at the end of settings_init()
+// - which runs once, early, before plan_reset() (or gc_init(), or any other while(looping)-scoped
+// init call) ever gets a chance to install a hook of its own. Confirmed on hardware: after
+// registering here exactly as documented for a plugin (save the previous handler, chain, install
+// mine), global_settings.on_changed still pointed at whichever module's hook happened to already
+// be live at that snapshot moment - not mine - so a runtime $100=... never reached this code at
+// all. Because this is a real bug in core's own notification plumbing, likely to affect any other
+// late-registered hook the same way, it doesn't belong hidden inside an unrelated performance fix;
+// it's called out on its own in PLAN.md.
+//
+// Sidestepping the whole question of hook timing: this checks the live setting itself on every
+// call and only redoes the division when it actually changed since last time - correct regardless
+// of what wrote it (a runtime $100=..., NVS restore at boot, anything else) or when, with no
+// dependency on any notification firing at all. The common case (nothing changed) costs one float
+// comparison per axis, still far cheaper than the division it replaces.
+static float steps_per_mm_inv[N_AXIS];
+static float steps_per_mm_cached[N_AXIS]; // Zero-initialized; steps_per_mm is never legitimately
+                                           // 0.0f, so the very first call for each axis always
+                                           // sees a "change" and computes a real value - no
+                                           // separate seeding step needed.
+
+static inline float get_steps_per_mm_inv (uint_fast8_t idx)
+{
+    if(settings.axis[idx].steps_per_mm != steps_per_mm_cached[idx]) {
+        steps_per_mm_cached[idx] = settings.axis[idx].steps_per_mm;
+        steps_per_mm_inv[idx] = 1.0f / steps_per_mm_cached[idx];
+    }
+
+    return steps_per_mm_inv[idx];
+}
+
 /*                            PLANNER SPEED DEFINITION
                                      +--------+   <- current->nominal_speed
                                     /          \
@@ -442,7 +481,7 @@ bool plan_buffer_line (float *target, plan_line_data_t *pl_data)
         if((delta_steps = target_steps[idx] - position_steps[idx])) {
             block->steps.value[idx] = labs(delta_steps);
             block->step_event_count = max(block->step_event_count, block->steps.value[idx]);
-            unit_vec[idx] = (float)delta_steps / settings.axis[idx].steps_per_mm; // Store unit vector numerator
+            unit_vec[idx] = (float)delta_steps * get_steps_per_mm_inv(idx); // Store unit vector numerator
             // Set direction bits. Bit enabled always means direction is negative.
             if(delta_steps < 0)
                 direction.bits |= bit(idx);
@@ -464,7 +503,7 @@ bool plan_buffer_line (float *target, plan_line_data_t *pl_data)
 
         float pos;
 
-        if((pos = (float)position_steps[block->spindle.css->axis] / settings.axis[block->spindle.css->axis].steps_per_mm - block->spindle.css->tool_offset) > 0.0f) {
+        if((pos = (float)position_steps[block->spindle.css->axis] * get_steps_per_mm_inv(block->spindle.css->axis) - block->spindle.css->tool_offset) > 0.0f) {
             if((block->spindle.rpm = block->spindle.css->surface_speed / (pos * (float)(2.0f * M_PI))) > block->spindle.css->max_rpm)
                 block->spindle.rpm = block->spindle.css->max_rpm;
         } else
@@ -678,7 +717,7 @@ float *plan_get_position (void)
 
     do {
         idx--;
-        position[idx] = pl.position[idx] / settings.axis[idx].steps_per_mm;
+        position[idx] = pl.position[idx] * get_steps_per_mm_inv(idx);
     } while(idx);
 
     return position;
