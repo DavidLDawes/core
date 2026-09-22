@@ -63,7 +63,10 @@ static block_buffer_t block_buffer;
 // be live at that snapshot moment - not mine - so a runtime $100=... never reached this code at
 // all. Because this is a real bug in core's own notification plumbing, likely to affect any other
 // late-registered hook the same way, it doesn't belong hidden inside an unrelated performance fix;
-// it's called out on its own in PLAN.md.
+// it's called out on its own in PLAN.md (2.1(7)) and since fixed there: settings_store_setting()
+// now dispatches global settings changes through the live grbl.on_settings_changed chain instead
+// of the frozen snapshot. This cache is kept as self-contained memoization regardless, rather than
+// switched back to a hook - it has no dependency on hook registration order either way.
 //
 // Sidestepping the whole question of hook timing: this checks the live setting itself on every
 // call and only redoes the division when it actually changed since last time - correct regardless

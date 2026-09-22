@@ -63,7 +63,7 @@ on a Pi.
 
 ## 1.1 Status
 
-Last updated 2026-09-22 (Step 6 landed).
+Last updated 2026-09-22 (Step 7 landed).
 
 | # | Item | Status |
 |---|---|---|
@@ -82,7 +82,7 @@ Last updated 2026-09-22 (Step 6 landed).
 | 13 | Critical hardware-only bug found + fixed: M62-M65 use-after-free (§2.1(3)) | **done** |
 | 14 | Part 5 Step 5 — driver defects, all of Part 3 (§3.1(1-5), §3.2(6-7)) | **done** — DavidLDawes/RP2040#4 |
 | 15 | Part 5 Step 6 — performance work, all four §2.3 items | **done** |
-| 16 | HIGH core bug found + not fixed: late-registered settings-changed hooks (§2.1(7)) | **found, open** |
+| 16 | Part 5 Step 7 — HIGH core bug fixed: late-registered settings-changed hooks (§2.1(7)) | **done** — confirmed on hardware via SWD breakpoint |
 | 17 | Remaining code fixes from Parts 2–4 (§2.1(4-6), §2.2(10-12), §2.4) | **not started** |
 
 The toolchain is installed and a full clean build has been verified on this
@@ -706,7 +706,7 @@ Fix: cache `next` before invoking `fn`.
 caller-supplied text into `xcommand[LINE_BUFFER_SIZE]` with no length check. `strlcpy` is
 already used elsewhere in the tree.
 
-### 7. `settings.c` — a late-registered `grbl.on_settings_changed` hook is silently never called for a single-setting write — HIGH — **found while fixing §2.3(1), not fixed**
+### 7. `settings.c` — a late-registered `grbl.on_settings_changed` hook is silently never called for a single-setting write — HIGH — **FIXED (Step 7)**
 
 Not in the original review; found while implementing the `steps_per_mm` reciprocal cache
 (§2.3(1)) and confirmed directly on hardware, not just by reading.
@@ -756,12 +756,31 @@ a `$100=...` write never reached it. `ioports.c`'s own hook is unaffected becaus
 same way - not independently verified with its own test, since what it recomputes was not
 traced, but the mechanism is the same call site with the same timing.
 
-**Not fixed here.** §2.3(1)'s planner.c fix sidesteps this entirely with a design that checks
-the live setting on every use rather than depending on a notification (see §2.3(1)). Fixing the
-underlying `settings.c` mechanism - so a hook installed at any point in boot is notified
-correctly - is a separate, more invasive change (touches the core dispatch every `$nnn=value`
-write goes through) with a blast radius across every module using this pattern, and is out of
-scope for what was asked here.
+**Fixed (Step 7).** `settings_store_setting()` now dispatches through the live
+`grbl.on_settings_changed` chain for `global_settings`, instead of the frozen `set->on_changed`
+snapshot - the same thing `settings_restore()` and the initial NVS load already did. The
+now-unused `global_settings.on_changed = grbl.on_settings_changed;` snapshot assignment at the
+end of `settings_init()` was removed. Modules with their own registered `setting_details_t`
+group (spindle plugins, kinematics modules) are unaffected - their group's `.on_changed` was
+never part of this snapshot mechanism.
+
+**Confirmed on hardware.** Built and flashed to the bench board, then verified with a hardware
+breakpoint set on `gcode.c`'s `onSettingsChanged` (the exact late-registered hook this bug
+affected, installed by `gc_init()`) via OpenOCD/GDB over SWD:
+
+- Before the fix: sending `$0=8` over serial returned `ok` immediately and the breakpoint never
+  fired - `gc_init()`'s hook was confirmed live (`grbl.on_settings_changed` read via SWD pointed
+  at it) but unreachable from this call path, exactly as diagnosed.
+- After the fix, same test: the write hung (no `ok` until resumed) and the breakpoint hit, with
+  a backtrace confirming the full path -
+  `onSettingsChanged (gcode.c:759)` ← `settings_store_setting (settings.c:3660)` ←
+  `system_execute_line` (handling `$0`) ← `protocol_main_loop` ← `grbl_enter` ← `main`.
+- The regression suite (24/24) still passes unchanged on the host simulator.
+
+This is a real, previously-undiscovered core bug independent of anything added this session: it
+silently affected `gc_init()`'s own hook (which calls `gc_spindle_off()` on a spindle-setting
+change) on every grblHAL board, for every `$nnn=value` write, since that hook has always
+installed itself the same way `plan_reset()`'s did.
 
 ## 2.2 Design and documentation
 
@@ -1302,29 +1321,24 @@ Two items (task-pool free list, AMASS loop) were verified for **correctness unde
 interrupt load**, not for a measured cycle-level improvement - the RP2040's Cortex-M0+ has no
 DWT cycle counter, so a precise jitter/latency number was not obtainable on this hardware.
 
-### Step 7 — The late-registered settings-changed hook bug (§2.1(7)) — **NEXT**
+### Step 7 — The late-registered settings-changed hook bug (§2.1(7)) — **DONE**
 
-Genuine, previously undocumented core bug, found while doing Step 6, not fixed. A hook chained
-onto `grbl.on_settings_changed` from anywhere in the `while(looping)` boot loop - `gc_init()`,
-`plan_reset()`, and by extension any future code following this file's own documented plugin
-pattern - is silently never notified of a runtime `$nnn=value` write to a built-in,
-`global_settings`-scoped setting, because `settings_store_setting()` dispatches through a
-snapshot of that chain taken once, at the end of `settings_init()`, before any such hook has
-had the chance to install itself.
+Fixed by making `settings_store_setting()` dispatch `global_settings` changes through the live
+`grbl.on_settings_changed` chain directly, dropping the frozen `set->on_changed` snapshot -
+option (b) from this entry's original write-up, chosen because it fixes the mechanism itself
+rather than narrowing the window until the next late hook. Audited every `set->on_changed`
+reader/writer in settings.c first to confirm no other call site depends on the old
+snapshot-at-init timing; the only reader was the one call site being changed, and non-global
+setting groups (their own dedicated `on_changed`, set directly by the registering plugin) don't
+go through this mechanism at all, so they're unaffected.
 
-Confirmed for planner.c's hook by reading `global_settings.on_changed`'s actual function
-pointer value out of RAM over SWD. `gcode.c`'s hook has the identical registration-timing
-pattern and is very likely affected too, though not independently confirmed with its own test.
-Fixing the underlying mechanism touches `settings_store_setting()`'s dispatch - the code path
-every `$nnn=value` command goes through - with a blast radius across every module using this
-pattern, so it deserves its own dedicated investigation rather than being folded into whatever
-else is being worked on when it's next touched. Start by working out whether the fix should be
-"settings_init() re-snapshots on every settings-changed dispatch" (cheap, but only closes the
-gap until the next hook registers after the next snapshot) or "settings_store_setting() calls
-grbl.on_settings_changed directly, dropping the snapshot indirection entirely" (the more
-correct-looking fix, but changes behaviour for every existing consumer of `set->on_changed`,
-including the plugin-registered groups that currently work correctly precisely because they
-don't rely on the shared snapshot at all).
+Verified decisively on hardware, not just by reading: built and flashed the fix, then used a
+hardware breakpoint on `gcode.c`'s `onSettingsChanged` (installed by `gc_init()`, the same
+registration-timing pattern documented in this finding) over SWD/GDB. Before the fix, `$0=8`
+returned `ok` immediately and the breakpoint never fired. After the fix, the identical write
+hung until resumed, with a backtrace confirming `system_execute_line` → `settings_store_setting`
+→ the live `grbl.on_settings_changed` → `onSettingsChanged`. Full write-up and backtrace in
+§2.1(7). Host regression suite (24/24) unaffected.
 
 ### Follow-ups from running on hardware
 
