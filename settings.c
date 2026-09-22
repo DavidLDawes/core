@@ -3642,17 +3642,26 @@ FLASHMEM status_code_t settings_store_setting (setting_id_t id, char *svalue)
         if(set->save)
             set->save();
 
-        if(set == &global_settings && set->on_changed == NULL)
-            set->on_changed = grbl.on_settings_changed;
+        settings_changed_flags_t changed = {0};
 
-        if(set->on_changed) {
+        changed.spindle = settings_changed_spindle() || machine_mode_changed;
+        machine_mode_changed = false;
 
-            settings_changed_flags_t changed = {0};
+        // global_settings.on_changed used to be a snapshot of grbl.on_settings_changed taken
+        // once, unconditionally, at the end of settings_init() - before plan_reset(), gc_init()
+        // and any plugin that chains onto grbl.on_settings_changed later, during the re-init
+        // loop, get a chance to install their hook. Those late hooks were silently never called
+        // from here. Dispatch through the live chain instead for global_settings; other setting
+        // groups keep their own dedicated on_changed, set directly by whichever plugin
+        // registered them and unaffected by this.
+        bool notified = set == &global_settings;
 
-            changed.spindle = settings_changed_spindle() || machine_mode_changed;
-            machine_mode_changed = false;
-
+        if(notified)
+            grbl.on_settings_changed(&settings, changed);
+        else if((notified = set->on_changed != NULL))
             set->on_changed(&settings, changed);
+
+        if(notified) {
 
             switch(setting->id) {
 
@@ -3861,8 +3870,6 @@ FLASHMEM void settings_init (void)
     }
 
     stream_mpg_set_baud(settings.mpg_baud_rate);
-
-    global_settings.on_changed = grbl.on_settings_changed;
 
     on_file_demarcate = grbl.on_file_demarcate;
     grbl.on_file_demarcate = onFileDemarcate;
