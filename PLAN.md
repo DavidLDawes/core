@@ -63,7 +63,7 @@ on a Pi.
 
 ## 1.1 Status
 
-Last updated 2026-09-22 (Step 5 landed).
+Last updated 2026-09-22 (Step 6 landed).
 
 | # | Item | Status |
 |---|---|---|
@@ -81,8 +81,9 @@ Last updated 2026-09-22 (Step 5 landed).
 | 12 | Part 5 Step 4 — run on hardware (§1.4, §1.9) | **done** |
 | 13 | Critical hardware-only bug found + fixed: M62-M65 use-after-free (§2.1(3)) | **done** |
 | 14 | Part 5 Step 5 — driver defects, all of Part 3 (§3.1(1-5), §3.2(6-7)) | **done** — DavidLDawes/RP2040#4 |
-| 15 | Part 5 Step 6 — performance work (§2.3) | **not started** — next |
-| 16 | Remaining code fixes from Parts 2–4 (§2.1(4-6), §2.2(9-12), §2.4) | **not started** |
+| 15 | Part 5 Step 6 — performance work, all four §2.3 items | **done** |
+| 16 | HIGH core bug found + not fixed: late-registered settings-changed hooks (§2.1(7)) | **found, open** |
+| 17 | Remaining code fixes from Parts 2–4 (§2.1(4-6), §2.2(10-12), §2.4) | **not started** |
 
 The toolchain is installed and a full clean build has been verified on this
 machine, producing `play/RP2040/build/grblHAL.uf2`. `build.sh` now defaults to the
@@ -589,11 +590,14 @@ Findings marked **FIXED** have been addressed on this fork; the rest are still o
 Line numbers are as of the original review, so they may have shifted slightly in fixed
 files.
 
-**Findings 1-9 below are from reading, not from running** - the original review pass.
-All fixes are verified as *compiling* across the six CI configurations. Findings 1 and 2
-are additionally verified with the host simulator (§1.8); finding 3 was not found by
-reading at all - it only surfaces under real hardware timing - and is verified on real
-hardware (§1.4, §1.9) with a dedicated regression test.
+**Most findings below are from reading, not from running** - the original review pass -
+except findings 3 and 7, both found later while doing hardware work rather than by
+reading, and both confirmed on hardware rather than read into existence: finding 3 only
+surfaces under real interrupt timing the simulator cannot reproduce, and finding 7 was
+confirmed by reading its actual state directly out of RAM over SWD. All fixes are verified
+as *compiling* across the six CI configurations; findings 1 and 2 are additionally verified
+with the host simulator (§1.8), finding 3 with a dedicated hardware regression test (§1.4,
+§1.9), and finding 7 is not fixed at all (§2.3(1) sidesteps it; see Part 5 Step 7).
 
 ## 2.1 Confirmed defects
 
@@ -701,14 +705,71 @@ Fix: cache `next` before invoking `fn`.
 caller-supplied text into `xcommand[LINE_BUFFER_SIZE]` with no length check. `strlcpy` is
 already used elsewhere in the tree.
 
+### 7. `settings.c` — a late-registered `grbl.on_settings_changed` hook is silently never called for a single-setting write — HIGH — **found while fixing §2.3(1), not fixed**
+
+Not in the original review; found while implementing the `steps_per_mm` reciprocal cache
+(§2.3(1)) and confirmed directly on hardware, not just by reading.
+
+`settings_store_setting()` - the function behind every `$nnn=value` command - does not call
+`grbl.on_settings_changed()` for the setting it just wrote. It calls `set->on_changed(...)`,
+where `set` is the `setting_details_t` group the setting belongs to and `set->on_changed` is a
+**snapshot** of `grbl.on_settings_changed`, taken **once**:
+
+```c
+if(set == &global_settings && set->on_changed == NULL)
+    set->on_changed = grbl.on_settings_changed;
+```
+
+and unconditionally again at the very end of `settings_init()`:
+
+```c
+global_settings.on_changed = grbl.on_settings_changed;
+```
+
+`settings_init()` runs once, early in `grbl_enter()`, before the `while(looping)` loop. Any
+module that installs its hook by chaining onto `grbl.on_settings_changed` from a function called
+**inside** that loop - `gc_init()`, `plan_reset()`, and by extension anything following the
+exact pattern this file's own CLAUDE.md documents for plugins - installs itself **after**
+`global_settings.on_changed` has already been snapshotted. `grbl.on_settings_changed` genuinely
+gets updated to point at the new hook; `global_settings.on_changed` does not, permanently. A
+runtime `$nnn=value` write to any core, `global_settings`-scoped setting (which covers most
+built-in settings, including every axis setting) then never reaches that hook - only a full
+settings reload or restore does, since those call sites (`settings_init()`, `settings_restore()`)
+use `grbl.on_settings_changed()` directly rather than going through `set->on_changed`.
+
+Modules that instead register their **own** `setting_details_t` group via `settings_register()`
+(spindle plugins, kinematics modules with their own settings) are unaffected - their group's
+`.on_changed` is assigned explicitly in the group's own initializer, not lazily snapshotted from
+the shared chain. The bug is specific to hooking the *shared* `grbl.on_settings_changed` chain to
+react to *built-in* `global_settings` changes, from *after* boot's settings load.
+
+**Confirmed on hardware** for planner.c's hook (installed exactly per the documented plugin
+pattern, from `plan_reset()`): after registering, `global_settings.on_changed` still pointed at
+whichever module's hook had already been live at the snapshot moment (`ioports.c`'s, confirmed
+by reading its function pointer directly out of RAM over SWD) - not the newly-installed one - so
+a `$100=...` write never reached it. `ioports.c`'s own hook is unaffected because
+`ioports_init()` runs during `driver_init()`, before `settings_init()`.
+
+`gcode.c`'s `onSettingsChanged` (`gc_init()`, called from the same loop position as
+`plan_reset()`) has the identical registration-timing pattern and is very likely affected the
+same way - not independently verified with its own test, since what it recomputes was not
+traced, but the mechanism is the same call site with the same timing.
+
+**Not fixed here.** §2.3(1)'s planner.c fix sidesteps this entirely with a design that checks
+the live setting on every use rather than depending on a notification (see §2.3(1)). Fixing the
+underlying `settings.c` mechanism - so a hook installed at any point in boot is notified
+correctly - is a separate, more invasive change (touches the core dispatch every `$nnn=value`
+write goes through) with a blast radius across every module using this pattern, and is out of
+scope for what was asked here.
+
 ## 2.2 Design and documentation
 
-### 7. `hal.h:638-641` — Doxygen comments swapped — LOW but public — **FIXED**
+### 8. `hal.h:638-641` — Doxygen comments swapped — LOW but public — **FIXED**
 
 `irq_enable` is documented as "Optional handler to **disable** global interrupts" and
 `irq_disable` as "...**enable**...". This is driver-author-facing generated API docs.
 
-### 8. `hal.irq_disable()` / `irq_enable()` don't save and restore the mask — MEDIUM — **FIXED**
+### 9. `hal.irq_disable()` / `irq_enable()` don't save and restore the mask — MEDIUM — **FIXED**
 
 They are unconditional, so they don't nest: an inner pair re-enables interrupts for the
 outer critical section too. Functions marked `ISR_CODE` and documented ISR-callable
@@ -716,7 +777,7 @@ outer critical section too. Functions marked `ISR_CODE` and documented ISR-calla
 calling them from an ISR clears PRIMASK *inside* that ISR. The contract isn't stated
 anywhere in `hal.h`.
 
-### 9. Aux I/O driven from the stepper ISR — MEDIUM
+### 10. Aux I/O driven from the stepper ISR — MEDIUM
 
 `ioport_digital_out()` / `ioport_analog_out()` are called from the stepper ISR
 (`stepper.c:513-519`) for M62–M65 motion-synchronised output. An aux port backed by an I²C
@@ -727,34 +788,112 @@ Same neighbourhood as §2.1(3)'s use-after-free - both are about the output-comm
 that this same ISR code walks. §2.1(3) fixes the list's memory safety; this finding about
 blocking on a slow port is still open.
 
-### 10. `stepper.c:815` — unguarded `exec_segment` deref — LOW / uncertain
+### 11. `stepper.c:815` — unguarded `exec_segment` deref — LOW / uncertain
 
 The experimental fast-hold path dereferences `st.exec_segment->n_step` with no NULL check,
 while every other use of `exec_segment` in the file is NULL-guarded. Marked experimental.
 
-### 11. `planner.c:401` — hidden state across reset — LOW
+### 12. `planner.c:401` — hidden state across reset — LOW
 
 `static axes_signals_t direction` persists across soft reset and is only updated for axes
 with a non-zero step delta. Likely deliberate, but `plan_reset()` doesn't clear it.
 
-### 12. No CI, no tests, no host-buildable target
+### 13. No CI, no tests, no host-buildable target
 
 For a codebase that moves a machine, this is the largest structural gap. See §2.3.
 
 ## 2.3 Optimisation opportunities
 
-* **Cache `1.0f / steps_per_mm` on settings change.** 52 sites divide by
-  `settings.axis[i].steps_per_mm`; `plan_buffer_line()` alone does `N_AXIS` divisions per
-  block on the queuing path.
-* **Hoist the AMASS shift loop out of the ISR** (`stepper.c:563`). It recomputes `N_AXIS`
-  shifts on every segment load, but the inputs only change when the block or AMASS level
-  changes.
-* **Give the task pool a real free list.** `task_alloc()` is an O(40) linear scan with
-  interrupts disabled, reachable from ISR context; the single-entry `last_freed` cache only
-  helps the immediately-repeated case. `task_add_delayed()` then walks the delayed list for
-  ordered insertion, also with interrupts off.
-* **`report_bitfield()`** (`report.c:1646`) mallocs, copies, `strtok`s and frees per call
-  purely to make a flash string mutable — it can iterate in place.
+All four items below are **FIXED**, landed together as PLAN.md Part 5 Step 6. All are
+foreground/planning-time or task-pool changes except the AMASS item, which is the one that
+actually touches the stepper ISR. See §2.1(7) for a significant, previously undocumented core
+bug found while implementing the `steps_per_mm` cache - not a performance item, a correctness
+one, and not folded into this section because of that.
+
+### 1. Cache `1.0f / steps_per_mm` on use — **FIXED**
+
+52 sites divide by `settings.axis[i].steps_per_mm`; `plan_buffer_line()` alone does `N_AXIS`
+divisions per block on the queuing path - foreground, not the stepper ISR, but the hot path
+for G-code streaming throughput.
+
+**Fix:** `planner.c` gained `get_steps_per_mm_inv(idx)`, a self-contained memoized reciprocal
+- it checks the live `settings.axis[idx].steps_per_mm` on every call and only redoes the
+division when it has actually changed since the last call, for that axis. `plan_buffer_line()`'s
+`unit_vec[]` calculation, its constant-surface-speed RPM calculation, and `plan_get_position()`
+(kinematics builds only) all now call it instead of dividing directly.
+
+This is deliberately **not** invalidated via a `grbl.on_settings_changed` hook, despite being
+the obvious, idiomatic-looking approach and despite this file's own doc comment initially saying
+exactly that. See §2.1(7): that mechanism turned out not to fire on a runtime `$100=...` write
+for a hook installed this late in boot, which the memoized-on-use design sidesteps entirely by
+not depending on any notification firing at all.
+
+**Verified on hardware**, decisively: `steps_per_mm_inv[0]` and its cache-tracking companion
+`steps_per_mm_cached[0]` were read directly out of RAM over SWD before and after a `$100=333`
+runtime change followed by a real move. Before: matched the old value. After: `333.0` and
+`1/333 = 0.003003...` exactly, both correct. The regression suite and both hardware stress
+tests (§1.4, §1.9) also pass with the change in place.
+
+### 2. Hoist the AMASS shift loop out of the ISR — **FIXED, with a correction to the original framing**
+
+`stepper.c:563` (as reviewed) recomputes `N_AXIS` shifts on every segment load. The original
+framing - "the inputs only change when the block or AMASS level changes" - undersold a real
+constraint worth stating precisely: `amass_level` is chosen **per segment** from that segment's
+instantaneous step rate (`st_prep_segment()`), and genuinely varies during a single block's
+acceleration/deceleration ramp. It is not a per-block constant, so the fix cannot cache the
+shifted values across a whole block - only skip recomputing them when neither the block nor the
+AMASS level actually changed since the previous segment, which is the common case (most
+segments in a block share both).
+
+**Fix:** a `new_segment_block` bool, captured before the existing new-block-detection branch
+overwrites `st.exec_block`, gates the AMASS recompute alongside an `amass_level` comparison
+against what was set on the previous segment load.
+
+**Verified on hardware** with unusual care, since this is the one item that touches the
+stepper ISR's step-count-affecting path directly, and a wrong version would not error or hang -
+it would silently lose or gain steps. Two tests, chosen to stress opposite ends of the
+condition: `hw_output_commands.py`'s 3000 alternating +0.01/-0.01mm moves are each entirely
+within their own accel/decel ramp, never reaching a cruise speed - close to the worst case for
+AMASS-level churn, and now additionally asserts the net position is exactly `X=0.0000` after all
+3000 (added specifically for this fix; a single mis-shifted segment would show up here).
+`hw_rt_stress.py`'s 20mm move has a genuine cruise phase (exercising the skip path many times in
+a row) plus a feed-hold-and-resume mid-flight, and still ends at exactly `X=20.000`. Both pass.
+
+### 3. Give the task pool a real free list — **FIXED**
+
+`task_alloc()` (`grbllib.c`) was an O(`CORE_TASK_POOL_SIZE`) linear scan with interrupts
+disabled, reachable from ISR context; the single-entry `last_freed` cache only helped when
+exactly one task had been freed since the last allocation - freeing a second task before the
+next alloc dropped it from the cache entirely, back onto the slow path.
+
+**Fix:** `task_free()`/`task_alloc()` now push/pop a genuine singly-linked free list, reusing
+each task's own `->next` field as the link - safe once a task is off every active list, since
+every `task_add_*()` already overwrites `->next` before putting a task back to work, confirmed
+by checking every `->next` reference in the file. O(1) on every free and every allocation, not
+just the lucky case. The pool is seeded into the free list once, at cold boot, right after the
+existing `memset(&tasks, 0, sizeof(tasks))` - required, since a bare memset leaves 40 good slots
+with no chain at all; the old scan didn't need this because it found unused slots by their
+zeroed `fn` field directly.
+
+**Verified on hardware**: `hw_output_commands.py`'s 3000 moves each carry an `M62`, which is
+3000 real interrupt-driven task allocate/free cycles through `task_add_immediate()` -
+`controller responsive after 3000 moves` and `free heap unchanged` both pass. Could not obtain a
+cycle-level latency measurement - the RP2040's Cortex-M0+ has no DWT cycle counter - so this is
+verified for correctness under real interrupt load, not for a measured jitter improvement.
+
+### 4. `report_bitfield()` avoids a per-call malloc/free — **FIXED**
+
+`report.c:1646` mallocs, copies, `strtok`s and frees a flash-resident format string on every
+call, purely so `strtok()` has a mutable buffer to tokenize in place.
+
+**Fix:** a small fixed-size stack buffer (96 bytes, comfortably over the longest bit label in
+the tree today at 44 characters) holds one token at a time; a hand-rolled scan replaces
+`strtok()`, matching its exact semantics (a run of consecutive commas is one delimiter, never an
+empty token) so this is a pure allocation-avoidance change with no parsing behaviour difference.
+
+**Verified by direct byte-for-byte diff**, not just the regression suite: `$$=22` and `$$=65`
+(two real bitfield settings, one of them exercising the "N/A" reserved-bit skip) produce
+byte-identical output before and after the change, in the simulator.
 
 ## 2.4 Extension opportunities
 
@@ -954,7 +1093,7 @@ This is the part that neither repo's own review surfaces.
 
 ## 4.1 `hal.irq_disable()` / `irq_enable()` do not nest, and ISR-callable core code calls them — HIGH — **FIXED**
 
-Part 2 §2.2(8) flagged that the HAL contract has no save/restore. The driver
+Part 2 §2.2(9) flagged that the HAL contract has no save/restore. The driver
 confirms it concretely:
 
 ```c
@@ -1003,7 +1142,7 @@ and correspondingly for `hal.irq_enable`/`hal.irq_disable`, which need a
 save/restore pair in the HAL contract rather than two independent void functions.
 That is an API change in core's `hal.h`, so it touches both repos — which is
 exactly why it belongs in Part 4. At minimum, core's `hal.h` should *document*
-that these do not nest (it currently documents them backwards; Part 2 §2.2(7)).
+that these do not nest (it currently documents them backwards; Part 2 §2.2(8)).
 
 ## 4.2 Pin activity can drive the stepper ISR into calling `free()` — HIGH
 
@@ -1095,7 +1234,7 @@ later.
 Needs both repos, which is why it comes after the harness exists.
 
 1. In core, change `hal.h` so the contract is a save/restore pair rather than two
-   independent voids, and fix the swapped Doxygen comments (Part 2 §2.2(7)).
+   independent voids, and fix the swapped Doxygen comments (Part 2 §2.2(8)).
 2. In the driver, implement it with `__get_PRIMASK()` / `__set_PRIMASK()` and fix
    the three `*Atomic` helpers the same way.
 3. Note it in `changelog.md` — it is an ABI change for every other driver.
@@ -1139,13 +1278,52 @@ timing), not just compiled. The I2C fixes and the overflow-shaped
 `ioports_analog.c` bug are compile-verified only - no I2C device is attached to
 the bench, and no board configuration reaches the overflow path.
 
-### Step 6 — Performance work (Part 2 §2.3) — **NEXT**
+### Step 6 — Performance work (Part 2 §2.3) — **DONE**
 
-Deliberately last. Every item — the `steps_per_mm` reciprocal cache, hoisting the
-AMASS shift out of the ISR, the task-pool free list — is a change to hot,
-hard-real-time code, and none should be attempted without the harness from Step 2
-and hardware from Step 4 to measure against. Optimising a 300 kHz ISR on the
-strength of code reading alone is how jitter bugs get introduced.
+All four items fixed: the `steps_per_mm` reciprocal cache (§2.3(1)), the AMASS shift-loop
+change-detection guard (§2.3(2)), the task-pool free list (§2.3(3)), and `report_bitfield()`'s
+malloc-free elimination (§2.3(4)). Used exactly the caution this entry originally called for -
+the harness from Step 2 and hardware from Step 4 to measure against, not code reading alone -
+and it paid off: the "obvious," idiomatic-looking approach for the `steps_per_mm` cache (a
+`grbl.on_settings_changed` hook, following this codebase's own documented plugin pattern)
+turned out to be silently broken by a pre-existing core bug (§2.1(7), found and confirmed on
+hardware, not fixed - out of scope for a performance pass). The shipped fix uses a
+self-contained memoized-on-use design instead, verified correct by reading the cache's actual
+value out of RAM over SWD before and after a runtime settings change.
+
+The AMASS fix - the one item that genuinely touches the stepper ISR's step-count-affecting path
+- got the most scrutiny: verified with a 3000-move adversarial test (each move entirely within
+its own accel/decel ramp, maximizing AMASS-level churn) asserting the net position lands on
+exactly zero, plus a separate cruise-phase move exercising the skip path many segments in a row.
+Both hold exactly.
+
+Two items (task-pool free list, AMASS loop) were verified for **correctness under real hardware
+interrupt load**, not for a measured cycle-level improvement - the RP2040's Cortex-M0+ has no
+DWT cycle counter, so a precise jitter/latency number was not obtainable on this hardware.
+
+### Step 7 — The late-registered settings-changed hook bug (§2.1(7)) — **NEXT**
+
+Genuine, previously undocumented core bug, found while doing Step 6, not fixed. A hook chained
+onto `grbl.on_settings_changed` from anywhere in the `while(looping)` boot loop - `gc_init()`,
+`plan_reset()`, and by extension any future code following this file's own documented plugin
+pattern - is silently never notified of a runtime `$nnn=value` write to a built-in,
+`global_settings`-scoped setting, because `settings_store_setting()` dispatches through a
+snapshot of that chain taken once, at the end of `settings_init()`, before any such hook has
+had the chance to install itself.
+
+Confirmed for planner.c's hook by reading `global_settings.on_changed`'s actual function
+pointer value out of RAM over SWD. `gcode.c`'s hook has the identical registration-timing
+pattern and is very likely affected too, though not independently confirmed with its own test.
+Fixing the underlying mechanism touches `settings_store_setting()`'s dispatch - the code path
+every `$nnn=value` command goes through - with a blast radius across every module using this
+pattern, so it deserves its own dedicated investigation rather than being folded into whatever
+else is being worked on when it's next touched. Start by working out whether the fix should be
+"settings_init() re-snapshots on every settings-changed dispatch" (cheap, but only closes the
+gap until the next hook registers after the next snapshot) or "settings_store_setting() calls
+grbl.on_settings_changed directly, dropping the snapshot indirection entirely" (the more
+correct-looking fix, but changes behaviour for every existing consumer of `set->on_changed`,
+including the plugin-registered groups that currently work correctly precisely because they
+don't rely on the shared snapshot at all).
 
 ### Follow-ups from running on hardware
 

@@ -506,7 +506,11 @@ ISR_CODE void ISR_FUNC(stepper_driver_interrupt_handler)(void)
             st.step_count = st.exec_segment->n_step; // NOTE: Can sometimes be zero when moving slow.
 
             // If the new segment starts a new planner block, initialize stepper variables and counters.
-            if(st.exec_block != st.exec_segment->exec_block) {
+            // Captured before the assignment below overwrites st.exec_block, and reused after the
+            // AMASS section to decide whether the shifted step counts need recomputing too.
+            bool new_segment_block = st.exec_block != st.exec_segment->exec_block;
+
+            if(new_segment_block) {
 
                 if((st.dir_changed.bits = st.dir_out.bits ^ st.exec_segment->exec_block->direction.bits))
                     st.dir_out = st.exec_segment->exec_block->direction;
@@ -576,13 +580,23 @@ ISR_CODE void ISR_FUNC(stepper_driver_interrupt_handler)(void)
 #if ADAPTIVE_MULTI_AXIS_STEP_SMOOTHING
 
             // With AMASS enabled, adjust Bresenham axis increment counters according to AMASS level.
-            st.amass_level = st.exec_segment->amass_level;
+            // Only recompute when something that feeds the shift actually changed: a new block (a
+            // different steps[] to shift) or a different AMASS level. amass_level is chosen per
+            // segment from that segment's instantaneous step rate (st_prep_segment()) and can change
+            // during a single block's acceleration/deceleration ramp, so it is NOT a per-block
+            // constant - this cannot be cached at block granularity, only skipped when neither input
+            // has changed since the previous segment, which is the common case (most segments in a
+            // block share both the block and its current AMASS bin).
+            if(new_segment_block || st.exec_segment->amass_level != st.amass_level) {
 
-            uint_fast8_t idx = N_AXIS;
-            do {
-                idx--;
-                st.steps.value[idx] = st.exec_block->steps.value[idx] >> st.amass_level;
-            } while(idx);
+                st.amass_level = st.exec_segment->amass_level;
+
+                uint_fast8_t idx = N_AXIS;
+                do {
+                    idx--;
+                    st.steps.value[idx] = st.exec_block->steps.value[idx] >> st.amass_level;
+                } while(idx);
+            }
 
 #endif
 

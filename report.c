@@ -1638,36 +1638,55 @@ void report_realtime_status (stream_write_ptr stream_write, status_report_tracki
 
 static void report_bitfield (const char *format, bool bitmap)
 {
-    char *s;
+    // Bounded to comfortably exceed the longest bit label in the tree today (44 chars,
+    // "Run startup scripts only on homing completed" in settings.c) with real headroom for
+    // plugin-defined format strings this file doesn't see.
+    char element[96];
     uint_fast8_t bit = 0;
     uint_fast16_t val = 1;
 
-    // Copy string from Flash to RAM, strtok cannot be used unless doing so.
-    if((s = (char *)malloc(strlen(format) + 1))) {
+    // format may be flash-resident (read-only), so it cannot be tokenized in place the way
+    // strtok() needs to - the previous version copied the whole string to a malloc'd buffer
+    // purely to work around that, then freed it on every call. A short-lived local buffer for
+    // one token at a time removes the allocation entirely; nothing here needs the whole string
+    // to be mutable at once. Matches strtok(s, ",")'s own semantics exactly - a run of
+    // consecutive commas is one delimiter, never an empty token - so this is a pure
+    // allocation-avoidance change with no parsing behaviour difference.
+    const char *p = format;
 
-        strcpy(s, format);
-        char *element = strtok(s, ",");
+    while(*p) {
 
-        while(element) {
-            if(strcmp(element, "N/A")) {
-                hal.stream.write(ASCII_EOL);
-                hal.stream.write("    ");
-                hal.stream.write(uitoa(bit));
-                hal.stream.write(" - ");
-                if(*element)
-                hal.stream.write(element);
-                if(bitmap) {
-                    hal.stream.write(" (");
-                    hal.stream.write(uitoa(val));
-                    hal.stream.write(")");
-                }
+        while(*p == ',')
+            p++;
+
+        if(!*p)
+            break;
+
+        const char *start = p;
+        while(*p && *p != ',')
+            p++;
+
+        size_t len = (size_t)(p - start);
+        if(len >= sizeof(element))
+            len = sizeof(element) - 1;
+        memcpy(element, start, len);
+        element[len] = '\0';
+
+        if(strcmp(element, "N/A")) {
+            hal.stream.write(ASCII_EOL);
+            hal.stream.write("    ");
+            hal.stream.write(uitoa(bit));
+            hal.stream.write(" - ");
+            if(*element)
+            hal.stream.write(element);
+            if(bitmap) {
+                hal.stream.write(" (");
+                hal.stream.write(uitoa(val));
+                hal.stream.write(")");
             }
-            bit++;
-            val <<= 1;
-            element = strtok(NULL, ",");
         }
-
-        free(s);
+        bit++;
+        val <<= 1;
     }
 }
 

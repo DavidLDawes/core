@@ -123,7 +123,22 @@ def main():
         print("%d moves carrying an output command in %.0fs" % (done, time.monotonic() - t0))
         checks.append(("controller responsive after %d moves" % count, alive and done == count))
 
-        # 3. no leak
+        # 3. exact position after `count` alternating +0.01/-0.01 moves (count is even, so
+        # this should sum to precisely X=0.000). This is the sensitive check for the class of
+        # bug that matters most here: each of these moves is short enough to be entirely within
+        # its own accel/decel ramp, never reaching a steady cruise speed, so AMASS level changes
+        # on most segment boundaries rather than settling - close to the worst case for a bug in
+        # PLAN.md 2.3's AMASS shift-loop caching. A single mis-shifted segment would silently
+        # lose or gain a step; unlike a hang or a comms error, that would not raise an alarm or
+        # an error code, only leave the final position off by a fraction of a step.
+        if alive:
+            ser.write(b"?")
+            _, m = bridge.read_until(ser, re.compile(rb"<[A-Za-z]+\|MPos:(-?\d+\.\d+)"), 3)
+            final_x = float(m.group(1))
+            print("final X after %d alternating +/-0.01 moves: %.4f (want 0.0000)" % (count, final_x))
+            checks.append(("exact position after %d moves" % count, abs(final_x) < 0.0005))
+
+        # 4. no leak
         if alive:
             line(ser, b"G90\n")
             after = free_k(ser)

@@ -82,7 +82,7 @@ DCRAM static struct {
     volatile core_task_t *systick;       //!< Pointer to first entry of linked list of systick (1 ms) tasks to run.
     volatile core_task_t *on_booted;     //!< Pointer to first entry of linked list of tasks to run once on cold boot.
     volatile core_task_t *on_reset;      //!< Pointer to first entry of linked list of tasks to on soft reset.
-    volatile core_task_t *last_freed;    //!< Pointer to last freed task.
+    volatile core_task_t *free_list;   //!< Head of the singly-linked list of unused pool entries (via ->next). See task_alloc()/task_free().
     core_task_t pool[CORE_TASK_POOL_SIZE];
 } tasks;
 #ifdef KINEMATICS_API
@@ -96,10 +96,13 @@ __attribute__((weak)) void board_ports_init (void)
 
 __attribute__((always_inline)) static inline void task_free (core_task_t *task)
 {
+    // Push onto the pool free list, reusing ->next as the link - safe once a task is off every
+    // active list, since task_add_*() always overwrites ->next before putting a task back to
+    // work. Every free goes on the list now, not just the first one since the last alloc, so
+    // task_alloc() below never needs to fall back to scanning the pool.
     task->fn = NULL;
-    task->next = NULL;
-    if(tasks.last_freed == NULL)
-        tasks.last_freed = task;
+    task->next = (core_task_t *)tasks.free_list;
+    tasks.free_list = task;
 }
 
 __attribute__((always_inline)) static inline core_task_t *task_run (core_task_t *task)
@@ -259,6 +262,18 @@ FLASHMEM int grbl_enter (void)
 
     memset(&sys, 0, sizeof(system_t));
     memset(&tasks, 0, sizeof(tasks));
+
+    // Seed the pool free list - see task_alloc()/task_free(). One-time, at cold boot only:
+    // this init sequence does not re-run on a soft reset (that happens further down, inside
+    // the while(looping) loop below), and the free list persists across soft resets exactly
+    // as the pool itself always has.
+    {
+        uint_fast8_t idx = CORE_TASK_POOL_SIZE;
+        do {
+            tasks.pool[--idx].next = (core_task_t *)tasks.free_list;
+            tasks.free_list = &tasks.pool[idx];
+        } while(idx);
+    }
 
     // Clear all and set some core function pointers
     memset(&grbl, 0, sizeof(grbl_t));
@@ -531,16 +546,13 @@ FLASHMEM int grbl_enter (void)
 
 __attribute__((always_inline)) static inline core_task_t *task_alloc (void)
 {
-    core_task_t *task = NULL;
-    uint_fast8_t idx = CORE_TASK_POOL_SIZE;
+    // O(1) always, not just for the slot most recently freed - was an O(CORE_TASK_POOL_SIZE)
+    // linear scan with interrupts disabled on any allocation past the first, since freeing a
+    // second task before the next alloc dropped it from the (single-slot) cache entirely.
+    core_task_t *task = (core_task_t *)tasks.free_list;
 
-    if(tasks.last_freed) {
-        task = tasks.last_freed;
-        tasks.last_freed = NULL;
-    } else do {
-        if(tasks.pool[--idx].fn == NULL)
-            task = &tasks.pool[idx];
-    } while(task == NULL && idx);
+    if(task)
+        tasks.free_list = (volatile core_task_t *)task->next;
 
     return task;
 }
