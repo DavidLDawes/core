@@ -154,6 +154,24 @@ static inline float get_steps_per_mm_inv (uint_fast8_t idx)
   look-ahead blocks numbering up to a hundred or more.
 
 */
+
+// Squared speeds are never negative, and non-negative IEEE 754 floats order exactly like their
+// bit patterns read as integers. On FPU-less MCUs this replaces a soft-float library call with
+// one integer compare in planner_recalculate(), which runs over every block in the deceleration
+// ramp for every queued line.
+static inline int32_t speed_sqr_bits (float speed_sqr)
+{
+    union {
+        float f;
+        int32_t i;
+    } u = { .f = speed_sqr };
+
+    return u.i;
+}
+
+#define speed_sqr_lt(a, b) (speed_sqr_bits(a) < speed_sqr_bits(b))
+#define speed_sqr_eq(a, b) (speed_sqr_bits(a) == speed_sqr_bits(b))
+
 static void planner_recalculate (void)
 {
     // Initialize block pointer to the last block in the planner buffer.
@@ -189,9 +207,9 @@ static void planner_recalculate (void)
             st_update_plan_block_parameters(false);
 
         // Compute maximum entry speed decelerating over the current block from its exit speed.
-        if (current->entry_speed_sqr != current->max_entry_speed_sqr) {
+        if (!speed_sqr_eq(current->entry_speed_sqr, current->max_entry_speed_sqr)) {
             entry_speed_sqr = next->entry_speed_sqr + current->max_delta_speed_sqr;
-            current->entry_speed_sqr = entry_speed_sqr < current->max_entry_speed_sqr ? entry_speed_sqr : current->max_entry_speed_sqr;
+            current->entry_speed_sqr = speed_sqr_lt(entry_speed_sqr, current->max_entry_speed_sqr) ? entry_speed_sqr : current->max_entry_speed_sqr;
         }
     }
 
@@ -208,10 +226,10 @@ static void planner_recalculate (void)
         // Any acceleration detected in the forward pass automatically moves the optimal planned
         // pointer forward, since everything before this is all optimal. In other words, nothing
         // can improve the plan from the buffer tail to the planned pointer by logic.
-        if (current->entry_speed_sqr < next->entry_speed_sqr) {
+        if (speed_sqr_lt(current->entry_speed_sqr, next->entry_speed_sqr)) {
             entry_speed_sqr = current->entry_speed_sqr + current->max_delta_speed_sqr;
         // If true, current block is full-acceleration and we can move the planned pointer forward.
-            if (entry_speed_sqr < next->entry_speed_sqr) {
+            if (speed_sqr_lt(entry_speed_sqr, next->entry_speed_sqr)) {
                 next->entry_speed_sqr = entry_speed_sqr; // Always <= max_entry_speed_sqr. Backward pass sets this.
                 block_buffer.planned = block; // Set optimal plan pointer.
             }
@@ -221,7 +239,7 @@ static void planner_recalculate (void)
         // point in the buffer. When the plan is bracketed by either the beginning of the
         // buffer and a maximum entry speed or two maximum entry speeds, every block in between
         // cannot logically be further improved. Hence, we don't have to recompute them anymore.
-        if (next->entry_speed_sqr == next->max_entry_speed_sqr)
+        if (speed_sqr_eq(next->entry_speed_sqr, next->max_entry_speed_sqr))
             block_buffer.planned = block;
 
         block = block->next;
