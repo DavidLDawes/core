@@ -1065,6 +1065,12 @@ On the plateau the rate scales roughly with the cube root of the per-block cost,
 line lengthens the ramp: at 2204 lines/s the ramp is ~242 blocks × 0.72 µs ≈ 174 µs, measured 175.
 Recalculation is now 39% of a plateau line (was 56%).
 
+Uninstrumented `$398` sweep at 100 mm/s² (`hw_planner_sweep.py`), before → after: 100 blocks
+1417 → 1417 (look-ahead bound), 200 → 1695 → 2001 (now look-ahead bound; predicted 2000), 400 1666
+→ 2272, 800 1703 → 2206, 1000 1704 → 2248. At the default 10 mm/s² nothing changes (447 / 635 / 832,
+bound by look-ahead or `$110`). RAM cost is the 4 bytes per block: free memory at 1000 blocks
+126K → 122K.
+
 **Tried and rejected:** running `planner_recalculate()` from RAM (`ISR_FUNC`) - no gain (341 →
 349 µs, within noise). The loop is bound by software floating point on the FPU-less M0+, not by
 XIP fetches. Note that a rebuild alone moves unrelated sections by ±10-15% (code layout vs. the
