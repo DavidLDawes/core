@@ -85,7 +85,7 @@ Last updated 2026-09-22 (item 19: line-rate measurement and planner cache).
 | 16 | Part 5 Step 7 — HIGH core bug fixed: late-registered settings-changed hooks (§2.1(7)) | **done** — confirmed on hardware via SWD breakpoint |
 | 17 | Remaining code fixes from Parts 2–4 (§2.1(4-6), §2.2(10-12), §2.4) | **done** — 5 fixed, 1 investigated and closed as not-a-bug; fuzzing/Doxyfile/kinematics-CI in §2.4 deliberately left as future work |
 | 18 | Hardware smoke test of item 17's fixes | **done** — built, flashed, full regression suite green (sim 26/26, hardware 24/24 + 2 sim-only) |
-| 19 | Streaming line rate measured and profiled on hardware; planner per-block cost cut 30% (§2.3(5)) | **done** — 1639 → 1773 lines/s at the recalculation-bound plateau |
+| 19 | Streaming line rate measured and profiled on hardware; planner per-block cost cut 71% (§2.3(5)) | **done** — 1639 → 2204 lines/s at the recalculation-bound plateau |
 
 The toolchain is installed and a full clean build has been verified on this
 machine, producing `play/RP2040/build/grblHAL.uf2`. `build.sh` now defaults to the
@@ -1011,7 +1011,7 @@ empty token) so this is a pure allocation-avoidance change with no parsing behav
 (two real bitfield settings, one of them exercising the "N/A" reserved-bit skip) produce
 byte-identical output before and after the change, in the simulator.
 
-### 5. Streaming line rate: measured, profiled, and `planner_recalculate()` made cheaper — **FIXED (partly)**
+### 5. Streaming line rate: measured, profiled, and `planner_recalculate()` made 3.5× cheaper — **FIXED (partly)**
 
 Measured on the bench RP2040 Pico (200 MHz, USB CDC, nothing attached) by streaming `+0.01mm`
 `G1` lines with the character-counting protocol real senders use (`test/hw_line_rate.py`,
@@ -1040,13 +1040,36 @@ Per-line foreground cost, plateau / high-accel: recalc 341 / 31 µs, parse (`gc_
 exclusive) 66 / 68, `st_prep_buffer` 62 / 64, `protocol_execute_realtime` (exclusive) 52 / 52,
 `ok` output 45 / 53, `plan_buffer_line` (exclusive) 30 / 29, stream read 15 / 14, stepper ISR 4 / 3.
 
-**Fix:** `plan_block_t` caches `max_delta_speed_sqr = 2 · acceleration · millimeters`, set in
-`plan_buffer_line()` and refreshed in `st_prep_buffer()` where the executing block's
+**Fix, part 1:** `plan_block_t` caches `max_delta_speed_sqr = 2 · acceleration · millimeters`, set
+in `plan_buffer_line()` and refreshed in `st_prep_buffer()` where the executing block's
 `millimeters` shrinks - the only two writers of either field. `planner_recalculate()` reads it
 instead of multiplying twice per block per pass. Same operands, same order of operations, so plans
-are bit-identical. Costs 4 bytes per planner block. Per-block recalculation cost 2.49 → 1.74 µs
-(-30%); plateau 1639 → 1773 lines/s (+8% - in this regime rate scales roughly with the cube root
-of per-block cost, because a faster line lengthens the ramp).
+are bit-identical. Costs 4 bytes per planner block.
+
+**Fix, part 2:** the loop then still made 3-5 soft-float compare calls per block (seen in the
+disassembly as `__wrap___aeabi_fcmp*`). Every value it compares is a squared speed - assigned only
+from squares, `0.0f`, `max()` with a positive constant, or sums of these and the non-negative cached
+product (`mm_remaining` never drops below `prep.mm_complete` ≥ 0) - and non-negative IEEE 754
+floats order exactly like their bit patterns read as `int32_t`. `speed_sqr_lt()`/`speed_sqr_eq()`
+compare those instead, leaving two `fadd` calls in the loop. Identical results for every
+non-negative, non-NaN input. The one divergence, +0.0 vs -0.0 comparing unequal, can only cause a
+redundant recompute or a missed early-stop marker, never a different plan.
+
+| | Before | Part 1 | Parts 1+2 |
+|---|---|---|---|
+| Recalculation per block | 2.49 µs | 1.74 µs | **0.72 µs** |
+| Plateau (400 blocks, 100 mm/s²) | 1639 lines/s | 1773 | **2204** |
+| Very high accel (5000 mm/s²) | 3216 lines/s | 3168 | 3440 |
+
+On the plateau the rate scales roughly with the cube root of the per-block cost, because a faster
+line lengthens the ramp: at 2204 lines/s the ramp is ~242 blocks × 0.72 µs ≈ 174 µs, measured 175.
+Recalculation is now 39% of a plateau line (was 56%).
+
+Uninstrumented `$398` sweep at 100 mm/s² (`hw_planner_sweep.py`), before → after: 100 blocks
+1417 → 1417 (look-ahead bound), 200 → 1695 → 2001 (now look-ahead bound; predicted 2000), 400 1666
+→ 2272, 800 1703 → 2206, 1000 1704 → 2248. At the default 10 mm/s² nothing changes (447 / 635 / 832,
+bound by look-ahead or `$110`). RAM cost is the 4 bytes per block: free memory at 1000 blocks
+126K → 122K.
 
 **Tried and rejected:** running `planner_recalculate()` from RAM (`ISR_FUNC`) - no gain (341 →
 349 µs, within noise). The loop is bound by software floating point on the FPU-less M0+, not by
