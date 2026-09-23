@@ -104,6 +104,8 @@ typedef struct plan_block {
 #endif
     float millimeters;              // The remaining distance for this block to be executed in (mm).
                                     // NOTE: This value may be altered by stepper algorithm during execution.
+    float max_delta_speed_sqr;      // 2 * acceleration * millimeters: largest change in speed^2 over the remaining block.
+                                    // NOTE: Must be updated whenever acceleration or millimeters changes.
 
     // Stored rate limiting data used by planner when changes occur.
     float max_junction_speed_sqr;   // Junction entry speed limit based on direction vectors in (mm/min)^2

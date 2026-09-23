@@ -171,7 +171,7 @@ static void planner_recalculate (void)
     plan_block_t *current = block;
 
     // Calculate maximum entry speed for last block in buffer, where the exit speed is always zero.
-    current->entry_speed_sqr = min(current->max_entry_speed_sqr, 2.0f * current->acceleration * current->millimeters);
+    current->entry_speed_sqr = min(current->max_entry_speed_sqr, current->max_delta_speed_sqr);
 
     block = block->prev;
     if (block == block_buffer.planned) { // Only two plannable blocks in buffer. Reverse pass complete.
@@ -190,7 +190,7 @@ static void planner_recalculate (void)
 
         // Compute maximum entry speed decelerating over the current block from its exit speed.
         if (current->entry_speed_sqr != current->max_entry_speed_sqr) {
-            entry_speed_sqr = next->entry_speed_sqr + 2.0f * current->acceleration * current->millimeters;
+            entry_speed_sqr = next->entry_speed_sqr + current->max_delta_speed_sqr;
             current->entry_speed_sqr = entry_speed_sqr < current->max_entry_speed_sqr ? entry_speed_sqr : current->max_entry_speed_sqr;
         }
     }
@@ -209,7 +209,7 @@ static void planner_recalculate (void)
         // pointer forward, since everything before this is all optimal. In other words, nothing
         // can improve the plan from the buffer tail to the planned pointer by logic.
         if (current->entry_speed_sqr < next->entry_speed_sqr) {
-            entry_speed_sqr = current->entry_speed_sqr + 2.0f * current->acceleration * current->millimeters;
+            entry_speed_sqr = current->entry_speed_sqr + current->max_delta_speed_sqr;
         // If true, current block is full-acceleration and we can move the planned pointer forward.
             if (entry_speed_sqr < next->entry_speed_sqr) {
                 next->entry_speed_sqr = entry_speed_sqr; // Always <= max_entry_speed_sqr. Backward pass sets this.
@@ -630,6 +630,8 @@ bool plan_buffer_line (float *target, plan_line_data_t *pl_data)
     }
 
 #endif // ENABLE_JERK_ACCELERATION
+
+    block->max_delta_speed_sqr = 2.0f * block->acceleration * block->millimeters;
 
     // TODO: Need to check this method handling zero junction speeds when starting from rest.
     if ((block_buffer.head == block_buffer.tail) || (block->condition.system_motion)) {

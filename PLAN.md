@@ -63,7 +63,7 @@ on a Pi.
 
 ## 1.1 Status
 
-Last updated 2026-09-22 (item 17 landed).
+Last updated 2026-09-22 (item 19: line-rate measurement and planner cache).
 
 | # | Item | Status |
 |---|---|---|
@@ -85,6 +85,7 @@ Last updated 2026-09-22 (item 17 landed).
 | 16 | Part 5 Step 7 — HIGH core bug fixed: late-registered settings-changed hooks (§2.1(7)) | **done** — confirmed on hardware via SWD breakpoint |
 | 17 | Remaining code fixes from Parts 2–4 (§2.1(4-6), §2.2(10-12), §2.4) | **done** — 5 fixed, 1 investigated and closed as not-a-bug; fuzzing/Doxyfile/kinematics-CI in §2.4 deliberately left as future work |
 | 18 | Hardware smoke test of item 17's fixes | **done** — built, flashed, full regression suite green (sim 26/26, hardware 24/24 + 2 sim-only) |
+| 19 | Streaming line rate measured and profiled on hardware; planner per-block cost cut 30% (§2.3(5)) | **done** — 1639 → 1773 lines/s at the recalculation-bound plateau |
 
 The toolchain is installed and a full clean build has been verified on this
 machine, producing `play/RP2040/build/grblHAL.uf2`. `build.sh` now defaults to the
@@ -1009,6 +1010,64 @@ empty token) so this is a pure allocation-avoidance change with no parsing behav
 **Verified by direct byte-for-byte diff**, not just the regression suite: `$$=22` and `$$=65`
 (two real bitfield settings, one of them exercising the "N/A" reserved-bit skip) produce
 byte-identical output before and after the change, in the simulator.
+
+### 5. Streaming line rate: measured, profiled, and `planner_recalculate()` made cheaper — **FIXED (partly)**
+
+Measured on the bench RP2040 Pico (200 MHz, USB CDC, nothing attached) by streaming `+0.01mm`
+`G1` lines with the character-counting protocol real senders use (`test/hw_line_rate.py`,
+`test/hw_planner_sweep.py`; rates are steady-state, after the planner buffer has filled).
+
+**What limits the rate depends on the regime:**
+
+| Regime | Limit | Measured |
+|---|---|---|
+| Direction reverses every line | full stop/restart per line at `$120` | ~12 lines/s at 10 mm/s² |
+| Buffer shorter than the stopping distance | look-ahead: v = √(2·a·`$398`·d) | 447 / 635 lines/s at 100 / 200 blocks, 10 mm/s² (predicted 447 / 632) |
+| Stopping distance fits in the buffer | `$110` | 833 lines/s at 500 mm/min (predicted 833) |
+| Realistic accel (100 mm/s²), buffer ≥ 200 | `planner_recalculate()` | ~1700 lines/s, **flat from 200 to 1000 blocks** |
+| Very high accel (5000 mm/s²) | fixed per-line foreground cost | ~3200 lines/s |
+
+**Why the plateau is flat in `$398`.** A throwaway `PROFILE_LINE_RATE` build (local branch
+`perf/line-rate-profile`, not merged; charges every foreground microsecond to exactly one section,
+so the sections sum to the window) showed `planner_recalculate()` taking 56% of each line on the
+plateau. Every new block re-plans all blocks in the final deceleration ramp - the `planned` pointer
+cannot pass them while blocks keep arriving - and that ramp is v²/2a long. Faster streaming means a
+longer ramp and a costlier line, so the rate settles at an equilibrium that no longer depends on
+buffer depth once the buffer is longer than the ramp. At 1639 lines/s and 100 mm/s² the ramp is
+~134 blocks × ~2.5 µs ≈ 335 µs; measured 341 µs.
+
+Per-line foreground cost, plateau / high-accel: recalc 341 / 31 µs, parse (`gc_execute_block`,
+exclusive) 66 / 68, `st_prep_buffer` 62 / 64, `protocol_execute_realtime` (exclusive) 52 / 52,
+`ok` output 45 / 53, `plan_buffer_line` (exclusive) 30 / 29, stream read 15 / 14, stepper ISR 4 / 3.
+
+**Fix:** `plan_block_t` caches `max_delta_speed_sqr = 2 · acceleration · millimeters`, set in
+`plan_buffer_line()` and refreshed in `st_prep_buffer()` where the executing block's
+`millimeters` shrinks - the only two writers of either field. `planner_recalculate()` reads it
+instead of multiplying twice per block per pass. Same operands, same order of operations, so plans
+are bit-identical. Costs 4 bytes per planner block. Per-block recalculation cost 2.49 → 1.74 µs
+(-30%); plateau 1639 → 1773 lines/s (+8% - in this regime rate scales roughly with the cube root
+of per-block cost, because a faster line lengthens the ramp).
+
+**Tried and rejected:** running `planner_recalculate()` from RAM (`ISR_FUNC`) - no gain (341 →
+349 µs, within noise). The loop is bound by software floating point on the FPU-less M0+, not by
+XIP fetches. Note that a rebuild alone moves unrelated sections by ±10-15% (code layout vs. the
+16 KB XIP cache), so single-build differences smaller than that are not significant.
+
+**Verified:** simulator 26/26, hardware 24/24 (+2 sim-only), and exact final position after 5000
+same-direction moves at 60000 mm/min / 5000 mm/s² and after 1000 alternating ±0.01 moves.
+
+**Not a bug, but worth knowing:** after 5000 `G91` `+0.01` moves the board reports X=49.9960, one
+step short of 50. The parser accumulates incremental targets in float32 and `plan_buffer_line()`
+`lroundf()`s the absolute target (`planner.c`), so the sum is 49.9976 → 12499 steps. A float32
+simulation reproduces both 3000 → 30.0000 and 5000 → 49.9960 exactly; it is independent of speed
+and settings, and upstream behaviour. `hw_line_rate.py` computes its expected position the same way.
+
+**Still open:**
+* `ok` output costs 45-53 µs per line: the RP2040 driver's `usb_out_chars()` runs `tud_task()`
+  and `tud_cdc_write_flush()` on every write, so each 4-byte response is its own USB packet.
+  17% of each line at high acceleration. Driver change.
+* An RP2350 (Pico 2, hardware single-precision FPU) should cut the recalc cost far more than any
+  code change here. Not measured.
 
 ## 2.4 Extension opportunities
 

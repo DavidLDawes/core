@@ -1474,6 +1474,7 @@ if(jlog.idx < sizeof(jlog.data) - 1 && prep.ramp_type != Ramp_Cruise) {
 
         // Update the appropriate planner and segment data.
         pl_block->millimeters = mm_remaining;
+        pl_block->max_delta_speed_sqr = 2.0f * pl_block->acceleration * mm_remaining;
         prep.steps_remaining = n_steps_remaining;
         prep.dt_remainder = ((float)n_steps_remaining - step_dist_remaining) * inv_rate;
 
