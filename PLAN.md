@@ -63,7 +63,7 @@ on a Pi.
 
 ## 1.1 Status
 
-Last updated 2026-09-22 (item 19: line-rate measurement and planner cache).
+Last updated 2026-09-25 (item 20: running G-code files from onboard flash).
 
 | # | Item | Status |
 |---|---|---|
@@ -86,6 +86,7 @@ Last updated 2026-09-22 (item 19: line-rate measurement and planner cache).
 | 17 | Remaining code fixes from Parts 2–4 (§2.1(4-6), §2.2(10-12), §2.4) | **done** — 5 fixed, 1 investigated and closed as not-a-bug; fuzzing/Doxyfile/kinematics-CI in §2.4 deliberately left as future work |
 | 18 | Hardware smoke test of item 17's fixes | **done** — built, flashed, full regression suite green (sim 26/26, hardware 24/24 + 2 sim-only) |
 | 19 | Streaming line rate measured and profiled on hardware; planner per-block cost cut 71% (§2.3(5)) | **done** — 1639 → 2204 lines/s at the recalculation-bound plateau |
+| 20 | Run G-code files from the controller: littlefs in onboard flash mounted as `/`, `$F` commands, YModem upload (`LITTLEFS_ENABLE=2` in the driver's `my_machine.h`) | **done** — `test/hw_file_run.py` 8/8 on the board, no core source change. The 1K `$I` heap drop this exposed in `hw_output_commands.py` is a one-off ~150-byte allocation (flat from move 50 to 1452, measured in bytes), not a leak; that test now warms up before taking its baseline |
 
 The toolchain is installed and a full clean build has been verified on this
 machine, producing `play/RP2040/build/grblHAL.uf2`. `build.sh` now defaults to the
