@@ -2802,8 +2802,16 @@ FLASHMEM void settings_write_global (void)
 // Write build info to persistent storage
 FLASHMEM void settings_write_build_info (char *line)
 {
-    if(hal.nvs.type != NVS_None)
-        hal.nvs.memcpy_to_nvs(NVS_ADDR_BUILD_INFO, (uint8_t *)line, sizeof(stored_line_t), true);
+    if(hal.nvs.type != NVS_None) {
+        // Callers can pass a string shorter than stored_line_t - settings_restore()
+        // passes the BUILD_INFO literal, "" by default - so copy it into a full-size
+        // buffer rather than writing sizeof(stored_line_t) bytes straight from `line`,
+        // which read past the end of the literal (AddressSanitizer: global-buffer-
+        // overflow on first boot) and stored stale bytes after a shorter $I= string.
+        stored_line_t info = {0};
+        strncpy(info, line, sizeof(stored_line_t) - 1);
+        hal.nvs.memcpy_to_nvs(NVS_ADDR_BUILD_INFO, (uint8_t *)info, sizeof(stored_line_t), true);
+    }
 }
 
 // Read build info from persistent storage.
