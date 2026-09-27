@@ -107,8 +107,15 @@ def main():
                        (off, queued, on, off_again) == ("0", "0", "1", "0")))
 
         # 2. many moves each carrying an output command
-        before = free_k(ser)
+        # Warm up first: the first few dozen moves allocate ~150 bytes once, which then
+        # stay flat. $I reports whole KB, so that alone can flip the check below when free
+        # memory happens to sit just above a KB boundary (it does with LITTLEFS_ENABLE=2).
         line(ser, b"G91 G1 F6000\n")
+        for i in range(100):
+            line(ser, b"M62 P0\n")
+            line(ser, b"X%s\n" % (b"0.01" if i % 2 == 0 else b"-0.01"))
+        bridge.wait_idle(ser, 60)
+        before = free_k(ser)
         done, t0 = 0, time.monotonic()
         try:
             for i in range(count):
