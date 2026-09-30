@@ -87,6 +87,7 @@ Last updated 2026-09-25 (item 20: running G-code files from onboard flash).
 | 18 | Hardware smoke test of item 17's fixes | **done** — built, flashed, full regression suite green (sim 26/26, hardware 24/24 + 2 sim-only) |
 | 19 | Streaming line rate measured and profiled on hardware; planner per-block cost cut 71% (§2.3(5)) | **done** — 1639 → 2204 lines/s at the recalculation-bound plateau |
 | 20 | Run G-code files from the controller: littlefs in onboard flash mounted as `/`, `$F` commands, YModem upload (`LITTLEFS_ENABLE=2` in the driver's `my_machine.h`) | **done** — `test/hw_file_run.py` 8/8 on the board, no core source change. The 1K `$I` heap drop this exposed in `hw_output_commands.py` is a one-off ~150-byte allocation (flat from move 50 to 1452, measured in bytes), not a leak; that test now warms up before taking its baseline. Line rate from a file, same-direction `X0.01` lines (`test/hw_file_rate.py`, `$398`=400): **~4900 lines/s** at 5000 mm/s² (streamed over USB: 3759) - planner nearly empty, so per-line foreground cost is the limit and the file saves the per-line `ok` and USB read; **~2500 lines/s** at 100 mm/s² (streamed: 2303) - recalculation-bound (§2.3(5)), which the input source does not change |
+| 21 | Line rate on the Pico 2 (RP2350, hardware FPU) (§2.3(6)) | **measured** — from a file, same-direction `X0.01` lines, 400 blocks: **7370 lines/s** at 5000 mm/s² (Pico: ~4900, **1.5×** at 150 vs 200 MHz); ceiling **~8700 lines/s** at 1,000,000 mm/s²; at 100 mm/s² the look-ahead physics limit (2828) instead of recalculation. Streamed over USB: unchanged (~3700, link-bound). New: streaming collapses to ~670 lines/s at ≥200,000 mm/s² (open) |
 
 The toolchain is installed and a full clean build has been verified on this
 machine, producing `play/RP2040/build/grblHAL.uf2`. `build.sh` now defaults to the
@@ -1092,6 +1093,53 @@ and settings, and upstream behaviour. `hw_line_rate.py` computes its expected po
   17% of each line at high acceleration. Driver change.
 * An RP2350 (Pico 2, hardware single-precision FPU) should cut the recalc cost far more than any
   code change here. Not measured.
+
+### 6. Pico 2 (RP2350): line rate with a hardware FPU — **measured 2026-09-29**
+
+**The FPU is used without any code change.** The `pico2` build compiles with
+`-mcpu=cortex-m33 ... +fp -mfloat-abi=softfp`, so float arithmetic becomes FPU instructions.
+Counted in the disassembly of the same source:
+
+| Function | Pico (RP2040): soft-float calls | Pico 2 (RP2350): FPU instructions, soft-float calls |
+|---|---|---|
+| `plan_buffer_line` | 88 | 274, 0 |
+| `st_prep_buffer` | 150 | 292, 0 |
+| `planner_recalculate` | 3 | 14, 0 |
+
+**Measured** on the bench Pico 2 (RP2350 A2, 150 MHz, `default` role, nothing wired, core
+`9fd9508` as on the Pico), 20,000 same-direction `X0.01` lines, `$398=400`. Pico figures are
+the ones recorded above (§2.3(5), item 20), from the same scripts.
+
+| Test | Accel (mm/s²) | Pico 2 | Pico | Limit on the Pico 2 |
+|---|---|---|---|---|
+| From a file (`hw_file_rate.py`) | 5000 | **7370 lines/s**, planner nearly empty | ~4900 | per-line foreground cost (~136 µs) |
+| From a file | 1,000,000, `$110`=600,000 | **8734 lines/s**, planner nearly empty | not measured | per-line foreground cost (~115 µs): the ceiling |
+| From a file | 100 | **2828 lines/s**, planner full | ~2500 | look-ahead physics, √(2·a·`$398`·d) = 2828: no longer the CPU |
+| Streamed (`hw_line_rate.py`) | 5000 | 3702 lines/s | 3440-3759 | the USB link and `ok` protocol |
+| Streamed | 100 | 2667 lines/s | 2204-2303 | stream/recalculation |
+| Naive send-and-wait | any | 999 lines/s | ~1000 | USB round trip (1 ms) |
+
+So: **~1.5× per line at 5000 mm/s², despite a 25% lower clock**; at realistic acceleration the
+planner now runs at the physics limit; over USB nothing changes, because the link was already
+the limit.
+
+**Open: streaming collapses at extreme acceleration.** Streamed (never from a file), the rate
+falls from ~3700-4150 lines/s to **~610-670 lines/s**, reproducibly and without errors or lost
+lines, once `$120` reaches 200,000 mm/s² (400 blocks; between 200,000 and 400,000 with 100
+blocks). Sweep at 100 blocks, 60,000 mm/min: 20k 3708, 50k 4154, 100k 4037, 200k 3884, 400k 614.
+It depends on acceleration only (600,000 mm/min at 5000 mm/s²: normal), and streaming is then
+slower than naive send-and-wait (999), so it's an interaction with several lines in flight.
+Far above any real machine (10-5000 mm/s²), but unexplained. Not yet checked on the Pico, which
+was never run above 5000 mm/s²; that's the first step.
+
+**Bench findings on the way:**
+- **`$398` needs a reboot, not a soft reset.** The planner is sized at boot: after `$398=400`
+  and Ctrl-X the status still said `Bf:100` and every "400-block" run had used 100 blocks
+  (at 100 mm/s² that measured 1414 lines/s, exactly the 100-block look-ahead limit).
+  `$REBOOT` fixed it. `hw_file_rate.py` assumed the reset applied it; it now reads the
+  planner size in use and stops with a message when it differs.
+- A bare board starts in `Alarm` with `Pn:XYZHSEP` on the Pico 2 too: the same normally-closed
+  assumption as on the Pico ("Bench settings" above), same fix (`$5=7 $6=1 $14=70`).
 
 ## 2.4 Extension opportunities
 
