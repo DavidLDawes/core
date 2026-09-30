@@ -367,8 +367,14 @@ bool protocol_buffer_synchronize (void)
 
     // If system is queued, ensure cycle resumes if the auto start flag is present.
     protocol_auto_cycle_start();
-    
-    while((ok = protocol_execute_realtime()) && (plan_get_current_block() || state_get() == STATE_CYCLE));
+
+    while((ok = protocol_execute_realtime()) && (plan_get_current_block() || state_get() == STATE_CYCLE)) {
+        // A segment buffer underrun (the stepper ISR ran out of prepared segments) ends the
+        // cycle with blocks still planned: restart it, as the main loop does after every line.
+        // Idle only - a cycle start would also resume a feed hold or acknowledge a tool change.
+        if(state_get() == STATE_IDLE)
+            protocol_auto_cycle_start();
+    }
 
     return ok;
 }
