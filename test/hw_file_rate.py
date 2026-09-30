@@ -59,6 +59,15 @@ NAME = "/hw_rate.nc"
 STATUS = re.compile(rb"<([A-Za-z]+)\|MPos:(-?\d+\.\d+),[^|>]*(?:\|Bf:(\d+),(\d+))?")
 
 
+def planner_blocks(ser):
+    """Planner blocks in use: the free count while idle, from a status report."""
+    ser.write(b"?")
+    buf, _ = bridge.read_until(ser, STATUS, 3.0)
+    bridge.read_quiet(ser, 0.1, 0.5)
+    m = STATUS.search(buf)
+    return int(m.group(3)) if m and m.group(3) else None
+
+
 def main():
     if not 2 <= len(sys.argv) <= 6:
         sys.stderr.write("usage: hw_file_rate.py <port> [count] [max_rate] [accel] [blocks]\n")
@@ -88,7 +97,16 @@ def main():
                 bridge.command(ser, b"$121=%d\n" % accel)
             if blocks is not None:
                 bridge.command(ser, b"$398=%d\n" % blocks)
-                bridge.reset(ser)    # planner size takes effect on reset
+                bridge.reset(ser)
+                # The planner is sized at boot: a soft reset stores $398 but does
+                # not resize it (seen on the Pico 2, 2026-09-29). Check the size
+                # actually in use rather than trusting the setting.
+                in_use = planner_blocks(ser)
+                if in_use != blocks:
+                    sys.stderr.write("planner has %s blocks, not the %d in $398: the size is "
+                                     "set at boot, so run $REBOOT (or power-cycle) and "
+                                     "rerun\n" % (in_use, blocks))
+                    return 1
             active = get_settings(ser, {110, 120, 398})
 
             t0 = time.monotonic()
