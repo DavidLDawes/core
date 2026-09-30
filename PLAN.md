@@ -87,7 +87,7 @@ Last updated 2026-09-25 (item 20: running G-code files from onboard flash).
 | 18 | Hardware smoke test of item 17's fixes | **done** — built, flashed, full regression suite green (sim 26/26, hardware 24/24 + 2 sim-only) |
 | 19 | Streaming line rate measured and profiled on hardware; planner per-block cost cut 71% (§2.3(5)) | **done** — 1639 → 2204 lines/s at the recalculation-bound plateau |
 | 20 | Run G-code files from the controller: littlefs in onboard flash mounted as `/`, `$F` commands, YModem upload (`LITTLEFS_ENABLE=2` in the driver's `my_machine.h`) | **done** — `test/hw_file_run.py` 8/8 on the board, no core source change. The 1K `$I` heap drop this exposed in `hw_output_commands.py` is a one-off ~150-byte allocation (flat from move 50 to 1452, measured in bytes), not a leak; that test now warms up before taking its baseline. Line rate from a file, same-direction `X0.01` lines (`test/hw_file_rate.py`, `$398`=400): **~4900 lines/s** at 5000 mm/s² (streamed over USB: 3759) - planner nearly empty, so per-line foreground cost is the limit and the file saves the per-line `ok` and USB read; **~2500 lines/s** at 100 mm/s² (streamed: 2303) - recalculation-bound (§2.3(5)), which the input source does not change |
-| 21 | Line rate on the Pico 2 (RP2350, hardware FPU) (§2.3(6)) | **measured** — from a file, same-direction `X0.01` lines, 400 blocks: **7370 lines/s** at 5000 mm/s² (Pico: ~4900, **1.5×** at 150 vs 200 MHz); ceiling **~8700 lines/s** at 1,000,000 mm/s²; at 100 mm/s² the look-ahead physics limit (2828) instead of recalculation. Streamed over USB: unchanged (~3700, link-bound). New: streaming collapses to ~670 lines/s at ≥200,000 mm/s² (open) |
+| 21 | Line rate on the Pico 2 (RP2350, hardware FPU) (§2.3(6)) | **measured** — from a file, same-direction `X0.01` lines, 400 blocks: **7370 lines/s** at 5000 mm/s² (Pico: ~4900, **1.5×** at 150 vs 200 MHz); ceiling **~8700 lines/s** at 1,000,000 mm/s²; at 100 mm/s² the look-ahead physics limit (2828) instead of recalculation. Streamed over USB: unchanged (~3700, link-bound). Streaming collapses to ~670 lines/s at ≥200,000 mm/s² on both chips, and a file run **hangs** in Idle with blocks queued: a segment underrun that `protocol_buffer_synchronize()` never restarted. **Fixed in PR #21**; the file run now finishes. Caveat: the Pico 2's figures move ~15% with code layout, and the 8734 ceiling didn't reproduce (§2.3(6)) |
 
 The toolchain is installed and a full clean build has been verified on this
 machine, producing `play/RP2040/build/grblHAL.uf2`. `build.sh` now defaults to the
@@ -1113,7 +1113,7 @@ the ones recorded above (§2.3(5), item 20), from the same scripts.
 | Test | Accel (mm/s²) | Pico 2 | Pico | Limit on the Pico 2 |
 |---|---|---|---|---|
 | From a file (`hw_file_rate.py`) | 5000 | **7370 lines/s**, planner nearly empty | ~4900 | per-line foreground cost (~136 µs) |
-| From a file | 1,000,000, `$110`=600,000 | **8734 lines/s**, planner nearly empty | not measured | per-line foreground cost (~115 µs): the ceiling |
+| From a file | 1,000,000, `$110`=600,000 | **8734 lines/s**, planner nearly empty (not reproduced on 2026-09-29: 614-617, see below) | not measured | per-line foreground cost (~115 µs): the ceiling |
 | From a file | 100 | **2828 lines/s**, planner full | ~2500 | look-ahead physics, √(2·a·`$398`·d) = 2828: no longer the CPU |
 | Streamed (`hw_line_rate.py`) | 5000 | 3702 lines/s | 3440-3759 | the USB link and `ok` protocol |
 | Streamed | 100 | 2667 lines/s | 2204-2303 | stream/recalculation |
@@ -1129,8 +1129,67 @@ lines, once `$120` reaches 200,000 mm/s² (400 blocks; between 200,000 and 400,0
 blocks). Sweep at 100 blocks, 60,000 mm/min: 20k 3708, 50k 4154, 100k 4037, 200k 3884, 400k 614.
 It depends on acceleration only (600,000 mm/min at 5000 mm/s²: normal), and streaming is then
 slower than naive send-and-wait (999), so it's an interaction with several lines in flight.
-Far above any real machine (10-5000 mm/s²), but unexplained. Not yet checked on the Pico, which
-was never run above 5000 mm/s²; that's the first step.
+Far above any real machine (10-5000 mm/s²). **Explained on 2026-09-29 (next paragraphs): it
+happens on the Pico too, and it is a stepper underrun that the wait-for-motion loop never recovers
+from.**
+
+**Same on the Pico (RP2040), so it's core, not the chip.** Streamed, 600,000 mm/min, 400 blocks:
+100,000 mm/s² 4228 lines/s, 200,000 670, 400,000 667, 1,000,000 533.
+
+**From a file it doesn't slow down, it hangs.** `hw_file_rate.py` at 1,000,000 mm/s² never saw
+the program end: the Pico sat in `Idle` with `Bf:13` (387 of 400 blocks still queued), `SD:100.0`
+(the whole file read) and X stopped at 16.04 mm, indefinitely. The Pico 2's one "blank" run was
+the same thing. Each manual cycle start (`~`) then ran exactly 14 more blocks and stopped in
+`Idle` again.
+
+**Mechanism** (from the code):
+1. At this acceleration a 0.01 mm block executes in ~0.2 ms. The stepper ISR empties the segment
+   buffer faster than the foreground refills it, and on an empty buffer
+   (`stepper.c:608-619`) it calls `st_go_idle()` and flags `EXEC_CYCLE_COMPLETE`, whatever is
+   still in the planner. `state_cycle()` then goes to `STATE_IDLE`.
+2. Normally `protocol_auto_cycle_start()` restarts it: the main loop calls it after every line,
+   which is why streaming only slows (each new line restarts motion, so the rate becomes the
+   rate lines arrive).
+3. But `protocol_buffer_synchronize()` (`protocol.c`) calls `protocol_auto_cycle_start()` **once**,
+   then waits `while (plan_get_current_block() || state == STATE_CYCLE)` **without calling it
+   again**. An underrun inside that wait leaves `Idle` + queued blocks, and the loop spins
+   forever. A file's `M2`/`M30`, and any command that synchronizes (dwell, many M-codes, `$`
+   commands that wait for Idle), ends up in that loop. Upstream grbl 1.1 has the same loop.
+
+**Fixed (core PR #21, 2026-09-29):** the synchronize loop now calls
+`protocol_auto_cycle_start()` whenever the state is `STATE_IDLE`, i.e. it restarts after an
+underrun, as the main loop already does. Only from Idle: a cycle start would also resume a feed
+hold or acknowledge a tool change. Verified on both boards:
+- The 1,000,000 mm/s² file run **finishes**: Pico 3/3 at 533 lines/s (it hung before), Pico 2
+  614-617 lines/s.
+- `test/run_tests.sh --serial` 24/24 and the mhs2core hardware suite 9/9, on both.
+- Throughput at extreme acceleration stays collapsed (~530-620 lines/s from a file). The fix turns
+  the hang into slow completion; refilling the segment buffer for 0.2 ms blocks is the remaining
+  limit, and it's out of scope for any real machine. The streamed rate wasn't re-measured: the
+  main loop, which streaming uses, already restarted after every line.
+
+**Code layout moves the Pico 2's file rate by ~15%, so treat single-build figures as ±15%.**
+With the fix, 5000 mm/s² fell from 7372 to 6302 lines/s on the Pico 2 (and rose 4895 → 4984 on
+the Pico). The fix code never runs mid-file. It adds 52 bytes to `protocol_buffer_synchronize`,
+which shifts every later function, including the hot `st_prep_buffer`, executed from flash
+through the XIP cache (`0x100241a8` → `0x100241dc`). A placebo build settled it. It had no fix,
+just 52 never-executed bytes in the same function (`b 1f; .space 52`), giving a symbol table
+identical to the fix build's. It measured 6302/6304/6302, exactly the fix build's rate. So the
+7370 above was a lucky layout, not a property of the chip. To compare two builds' speed, compare
+layouts too, or put the hot foreground code in RAM.
+
+**Not reproduced: the 8734 lines/s "ceiling" at 1,000,000 mm/s² (table above).** On
+2026-09-29 the Pico 2 gave 614-617 lines/s with the same arguments, with and without the fix.
+That row needs a recheck before anyone relies on it.
+
+**Severity:** it needs acceleration far beyond real machines. It started between 100,000 and
+200,000 mm/s² here. But the failure is a silent hang with the machine reporting `Idle`: an agent
+waiting for Idle would see Idle while motion is still queued. Any other way of starving the
+segment buffer (a much slower MCU, a heavier kinematics model) could reach the same loop.
+
+**Test-script lesson:** `hw_file_rate.py`/`hw_line_rate.py` restore `$110`/`$120` in a
+`finally`, which a timeout kill skips. Both boards were left at 600,000 mm/min and 1,000,000 mm/s²
+until restored by hand. After any killed run, check `$110`-`$122`.
 
 **Bench findings on the way:**
 - **`$398` needs a reboot, not a soft reset.** The planner is sized at boot: after `$398=400`
